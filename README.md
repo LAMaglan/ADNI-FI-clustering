@@ -6,6 +6,8 @@ based on data from the Alzheimer's Disease Neuroimaging Iniative (ADNI):
 <br>
 http://adni.loni.usc.edu/
 <br>
+These scripts have been run with R version 3.6.2 on Windows 11.
+<br>
 <br>
 First, download the ADNIMERGE R-package (ADNIMERGE_0.0.1.tar.gz) from the following link:
 <br>
