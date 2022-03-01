@@ -1,0 +1,3250 @@
+---
+title: "`r analysis_title`"
+subtitle: "`r analysis_subtitle`"
+output: 
+    html_document: 
+      toc: true
+      toc_float: true
+      number_sections: true
+      theme: united
+---
+
+
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+
+# create subfolder for ML tables
+dir.create(file.path(results_dir, chosen_FI_refined))
+
+
+
+
+library(dplyr)
+library(tidyr) 
+library(magrittr) 
+
+### Imputation ###
+library("bnstruct") 
+
+
+library("ggsignif") # run comparisons + add "stars" to ggplot
+library("FactoMineR") # FAMD  and clustering
+library("factoextra")
+library("fdm2id") # compare cluster results with Jaccard index
+library("stringr") # string pattern matching + replacement
+
+library("cowplot") 
+library("reshape2")
+library("moonBook") #f or table of descriptives 
+library("ztable") # reporting ALL types of tables 
+
+
+# Comparing clusters
+library("MASS") # ordinal logistic regression (polr)
+library("afex") # type=III ANOVA
+set_sum_contrasts()
+
+library("car") # ANOVA function and vif
+
+
+# Classificaion
+library("discrim")
+library("tidymodels")
+
+#for cox regression
+library("survival")
+library("survminer")
+library("coxphw") # weighted estimation in cox regression
+library("timeROC") # compare coxreg
+library("patchwork") 
+
+# save table results in docx
+library("rrtable")
+
+knitr::opts_chunk$set(eval=TRUE)
+```
+
+
+Chosen sample is `r ADNI_sample`
+
+```{r run_certain_chunks, echo=FALSE}
+if (ADNI_sample == "ADNI1"){
+  only_for_ADNI1 = TRUE
+  only_for_ADNI2 = FALSE
+} else {
+  only_for_ADNI1 = FALSE
+  only_for_ADNI2 = TRUE
+}
+
+
+```
+
+```{r custom_funcs, echo=FALSE}
+
+### custom functions
+# compute cohen's D (Trung)
+computeCohenD <- function (t,df)
+{
+  cohen.d <- 2*t / (sqrt(df))
+}
+
+
+back_to_factor <- function(orig_data, imputed_cat){
+  
+  ## map back to factor, with correct values
+  ## use on data imputed with bnstruct::knn.impute
+  
+  # prep for mapping values to original values
+  # need to convert categorical data to numeric
+  # can't make work with lapply or dplyr (hm..)
+  
+  final_data <- as.data.frame(imputed_cat)
+  
+  for (i in 1:ncol(final_data)){
+    final_data[, i] <- as.character(final_data[, i])
+  }
+  
+  
+  for (i in 1:ncol(final_data)){
+    
+    if (is.factor(orig_data[,i])){
+      
+      # These variables should either have 2 or 3 levels
+      num_levels <- length(levels(orig_data[,i]))
+      
+      final_data[,i][final_data[,i] == 1] <- levels(orig_data[,i])[1]
+      final_data[,i][final_data[,i] == 2] <- levels(orig_data[,i])[2]
+      
+      if (num_levels == 3){
+        final_data[,i][final_data[,i] == 3] <- levels(orig_data[,i])[3]
+      }
+      
+    
+
+    }
+    
+    final_data[,i] <- factor(final_data[,i])
+    
+  }
+  return(final_data)
+  
+}
+
+
+
+evaluate_ML_final <- function(lda_model, FI_dataframe, Dx_groups="all"){
+  
+  
+  lda_FI_pred = predict(lda_model, FI_dataframe)
+  lda_FI_pred.prob = predict(lda_model, FI_dataframe, type="prob")
+  
+  if (Dx_groups!="all"){
+    FI_dataframe$Dx <- factor(FI_dataframe$Dx)
+    
+    my_metrics <- metric_set(accuracy, bal_accuracy, roc_auc,
+                          sens, spec, precision, recall)
+  }
+  
+  lda_FI_res <- cbind(FI_dataframe$Dx, lda_FI_pred, lda_FI_pred.prob)
+  
+  
+  
+  if (Dx_groups=="all"){
+    
+    names(lda_FI_res) <- c("obs", "pred", "pred_HC", "pred_MCI", "pred_AD")
+  
+    res <- lda_FI_res %>% 
+      metrics(obs, estimate=pred, pred_HC:pred_AD)
+    
+  } else if (Dx_groups=="HC and AD"){
+    
+    names(lda_FI_res) <- c("obs", "pred", "pred_HC", "pred_AD")
+  
+    res <- lda_FI_res %>% 
+      my_metrics(obs, estimate=pred, pred_HC)
+    
+  } else if (Dx_groups=="MCI and AD"){
+    
+    names(lda_FI_res) <- c("obs", "pred", "pred_MCI", "pred_AD")
+  
+    res <- lda_FI_res %>% 
+      my_metrics(obs, estimate=pred, pred_MCI)
+    
+  } else if (Dx_groups=="HC and MCI"){
+    
+    names(lda_FI_res) <- c("obs", "pred", "pred_HC", "pred_AD")
+  
+    res <- lda_FI_res %>% 
+      my_metrics(obs, estimate=pred, pred_HC)
+    
+  }
+  
+  
+  return(res)
+}
+
+
+
+annotate_ggsurv <- function(cox_object, ggsurv_object, main_var="string",
+                            round_digits=round_digits, text_size=5){
+  
+  cox_summary <- summary(cox_object)
+  
+  cox_HR <- round(cox_summary$conf.int[main_var,"exp(coef)"],round_digits)
+  cox_HR_conf_low <- round(cox_summary$conf.int[main_var,"lower .95"],round_digits)
+  cox_HR_conf_high <- round(cox_summary$conf.int[main_var,"upper .95"],round_digits)
+  cox_log_rank_p = cox_summary$sctest["pvalue"]
+  
+  if (cox_log_rank_p < 0.001){
+    cox_log_rank_p = "< 0.001"
+  } else {
+    cox_log_rank_p = round(cox_log_rank_p, round_digits)
+  }
+  
+  kaplan_label = paste0("HR ", cox_HR, " 95% CI", cox_HR_conf_low, "-", 
+                        cox_HR_conf_high, "\n", "Log-rank p= ", cox_log_rank_p)
+  
+  ggsurv_object$plot <- ggsurv_object$plot + 
+    ggplot2::annotate(
+      "text",
+      x = Inf, y = Inf,
+      vjust = 1, hjust = 1,
+      label = kaplan_label,
+      size=text_size
+    )
+  
+  return(ggsurv_object)
+}
+```
+
+```{r ML_names, echo=FALSE}
+
+if(chosen_FI_refined == "FI_refined_age_sex_edu") ML_name <-"Age_sex_edu_corr"
+if(chosen_FI_refined == "FI_refined_age_sex") ML_name <-"Age_sex_corr"
+if(chosen_FI_refined == "FI_refined_no_cov") ML_name <-"no_cov"
+
+```
+
+```{r glm_formulas, echo=FALSE}
+
+glm_outcome <- "tempvar"
+
+# specifications of models
+
+if (chosen_FI_refined == "FI_refined_age_sex_edu"){
+  cluster_compare_glm_variables <- c("cluster", "Age", "Sex", "PTEDUCAT")
+} else if (chosen_FI_refined == "FI_refined_age_sex"){
+  cluster_compare_glm_variables <- c("cluster", "Age", "Sex")
+} else if (chosen_FI_refined == "FI_refined_no_cov"){
+  cluster_compare_glm_variables <- c("cluster")
+}
+
+
+cluster_compare_glm_formula <- as.formula(
+  paste(glm_outcome, 
+        paste(cluster_compare_glm_variables, collapse = " + "), 
+        sep = " ~ "))
+
+```
+
+# Summary
+
+Analyses of frailty index (FI) and clustering based on the variables in the FI
+
+FAMD, a combination of MFA and PCA, decomposes the "expert-driven" FI variables into
+PCs. 
+<br>
+The number in front of a group denotes the cluster
+e.g. HC1 is HC in cluster 1
+<br>
+
+```{r, eval=only_for_ADNI1, echo=FALSE}
+
+print(paste0("All cluster analyses (across Dx) are corrected for", cluster_compare_glm_variables[2:length(cluster_compare_glm_variables)], "."))
+```
+
+ 
+<br>
+Cox regression analyses are corrected by a combination of several covariates,
+<br>
+including linear effects of age.
+<br>
+Supplementary analyses for cox regression also correct for CDRSB
+
+
+The % threshold for choosing number of components in FAMD (dimensionality reduction) is `r FAMD_threshold``
+
+
+
+
+
+```{r load_data, include=FALSE}
+if (ADNI_sample=="ADNI1") file="intermediate_files/d_all_FI.csv"
+if (ADNI_sample=="ADNI2 & ADNIGO") file = "intermediate_files/ADNI2_ADNIGO_d_all_FI.csv"
+
+data_orig <- read.csv(file.path(wd, file), head=TRUE,sep=",", na.strings="NA",
+                      stringsAsFactors = TRUE)
+```
+
+
+Dataset size is `r nrow(data_orig)`
+
+```{r, include=FALSE}
+data_all <- data_orig
+
+
+if("FI_expert" %in% colnames(data_all)){
+  names(data_all)[names(data_all)=="FI_expert"] <- "FI_Expert"
+}
+
+# If weird naming
+if("Lab_Blood_HCT." %in% colnames(data_all)){
+  names(data_all)[names(data_all)=="Lab_Blood_HCT."] <- "Lab_Blood_HCT" #doing it here instead of below
+}
+
+
+# chosen FI 
+names(data_all)[names(data_all)==chosen_FI_standard] <- "FI_standard"
+
+if (chosen_FI_refined %in% names(data_all)){
+  names(data_all)[names(data_all)==chosen_FI_refined] <- "FI_refined"
+  add_new_FI_to_list = FALSE
+} else {
+  # used to print later
+  add_new_FI_to_list = TRUE
+}
+
+
+### Remove any rows with missing FI
+data_all <- data_all[!is.na(data_all$FI_standard), ]
+#####
+
+
+
+data <- data_all
+
+data_all$Dx<-factor(data_all$Dx, levels=c("HC","MCI","AD")) #reordering (for plots)
+
+
+#new: combining HC and MCI into one group (non-demented)
+data_all$alt_Dx<-as.character(data_all$Dx)
+data_all$alt_Dx<-sub("HC","non-demented", data_all$alt_Dx)
+data_all$alt_Dx<-sub("MCI","non-demented", data_all$alt_Dx)
+data_all$alt_Dx<-factor(data_all$alt_Dx, levels=c("non-demented","AD"))
+
+
+```
+
+
+
+
+# FI characteristics
+
+## Standard FI
+
+```{r, echo=FALSE}
+
+data <- data_all 
+
+data$Dx <- factor(data$Dx, levels=c('HC','MCI','AD')) #to get the "order" for plots
+
+#histogram with FI
+plot.hist<-ggplot(data, aes(x = FI_standard, ..density.., fill=Dx))+
+  geom_density(alpha=0.4)+
+  labs(x="FI")
+
+
+plot.hist
+
+FI_cor<-cor(data$FI_standard,data$Age)
+
+##Scatterplot FI x age
+plot.scat<-ggplot(data, aes(x=Age, y=FI_standard, color=Dx))+
+  geom_point(alpha=0.7)+
+  geom_smooth(color = "black", method="loess")+ #one STRAIGHT line for ALL
+  theme(legend.position="none")+
+  annotate("text", x=80, y = 0.43, label = paste0("r = ", round(FI_cor,3)))+
+  scale_color_brewer(palette="Accent")+
+  labs(y="FI")
+       
+
+
+
+##Boxplot FI
+plot.box<-ggplot(data, aes(x=Dx, y=FI_standard, fill=Dx))+
+  geom_boxplot(notch = TRUE)+
+  geom_signif(comparisons = list(c("HC","MCI")), map_signif_level = TRUE,
+              y_position=0.4)+
+  geom_signif(comparisons = list(c("MCI","AD")), map_signif_level = TRUE,
+              y_position=0.45)+
+  geom_signif(comparisons = list(c("HC","AD")), map_signif_level = TRUE,
+              y_position = 0.48)+
+  ylim(c(0,0.52))+ 
+    theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())+
+  scale_fill_brewer(palette="Accent")+
+  labs(y="FI",
+       x="")
+
+
+
+plot_grid(plot.box, plot.scat, labels = c("A", "B"))
+  
+```
+
+
+## cluster refined FI
+
+```{r refined_FI_plot, echo=FALSE}
+
+if ("FI_refined" %in% names(data)){
+  plot.hist.refined<-ggplot(data, aes(x = FI_refined, ..density.., fill=Dx))+
+  geom_density(alpha=0.4)+
+  labs(x="FI")
+
+  plot.hist.refined
+  
+  FI_refined_cor<-cor(data$FI_refined,data$Age)
+  
+  plot.scat.refined<-ggplot(data, aes(x=Age, y=FI_refined, color=Dx))+
+    geom_point(alpha=0.7)+
+    geom_smooth(color = "black", method="loess")+ 
+    theme(legend.position="none")+
+    annotate("text", x=80, y = 0.43, label = paste0("r = ", round(FI_refined_cor,3)))+
+    scale_color_brewer(palette="Accent")+
+    labs(y="FI")
+         
+  
+  
+  
+  ##Boxplot FI
+  plot.box.refined<-ggplot(data, aes(x=Dx, y=FI_refined, fill=Dx))+
+    geom_boxplot(notch = TRUE)+
+    geom_signif(comparisons = list(c("HC","MCI")), map_signif_level = TRUE,
+                y_position=0.4)+
+    geom_signif(comparisons = list(c("MCI","AD")), map_signif_level = TRUE,
+                y_position=0.45)+
+    geom_signif(comparisons = list(c("HC","AD")), map_signif_level = TRUE,
+                y_position = 0.48)+
+    ylim(c(0,0.52))+ 
+      theme(axis.text.x=element_blank(),
+          axis.ticks.x=element_blank())+
+    scale_fill_brewer(palette="Accent")+
+    labs(y="FI",
+         x="")
+  
+  
+  
+  plot_grid(plot.box.refined, plot.scat.refined, labels = c("A", "B"))
+}
+
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+
+ggplot(data, aes(x=Age, y=IC3, color=Dx))+
+  geom_point()+
+  geom_smooth(method="loess")
+
+```
+
+
+
+```{r FAMD_prep, include = FALSE, eval=only_for_ADNI1}
+
+all_FI_list <- read.csv(paste0(wd, "/list_frailty_indices.csv"), stringsAsFactors = FALSE)
+if("FI_expert" %in% colnames(all_FI_list)){
+  names(all_FI_list)[names(all_FI_list)=="FI_expert"] <- "FI_Expert"
+}
+names(all_FI_list)[names(all_FI_list)==chosen_FI_standard] <- "FI_standard"
+
+# remove "_binarized" suffix from all variables
+all_FI_list$variable <- stringr::str_remove(all_FI_list$variable, "_binarized")
+
+# add back "_binarized" to FAQ variables
+FAQ_index <- str_detect(all_FI_list$variable, "FAQ")
+all_FI_list$variable[FAQ_index] <- paste0(all_FI_list$variable[FAQ_index], "_binarized")
+
+
+cat_cols <- all_FI_list %>% 
+  dplyr::filter(type=="cat") %>% 
+  dplyr::filter(FI_standard == 1) %>% 
+  dplyr::select(variable) %>% 
+  pull()
+
+categorical <- data_all %>% 
+  dplyr::select(all_of(cat_cols))
+
+cont_cols <- all_FI_list %>% 
+  dplyr::filter(type=="cont") %>% 
+  dplyr::filter(FI_standard == 1) %>% 
+  dplyr::select(variable) %>% 
+  pull()
+
+cont <- data_all %>% 
+  dplyr::select(all_of(cont_cols))
+```
+
+```{r knn_imputation, include = FALSE, eval=only_for_ADNI1}
+
+
+cat_integer <- categorical
+
+#need to convert "factor" data to numeric for
+#bnstruct
+for (i in 1:ncol(categorical)){
+  cat_integer[, i] <- as.numeric(categorical[, i])
+}
+
+missing_cat <- colSums(is.na(cat_integer)) 
+missing_cont <- colSums(is.na(cont))
+
+k=10 # default
+
+tempData <- as.matrix(cbind(cat_integer, cont))
+
+
+set.seed(123)
+imputed_data <- as.data.frame(
+  bnstruct::knn.impute(data=tempData, k=k,
+                                 cat.var = 1:ncol(cat_integer)) #specify categorical 
+)
+
+
+rm(tempData)
+
+cat_integer <- imputed_data[,cat_cols]
+
+
+
+
+# convert data back to factor, mapping with actual values
+categorical <- back_to_factor(categorical, cat_integer)
+rm(cat_integer)
+
+cont <- imputed_data[, cont_cols]
+
+data_all[, cat_cols] <- categorical
+data_all[, cont_cols] <- cont
+
+
+input <- cbind(categorical, cont)
+input_clustering <- input
+```
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+
+print("The quantitative variables included in FI are:\n")
+cont_cols
+```
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("The qualititative variables included in FI are:\n")
+cat_cols
+```
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("# FAMD details\\n")
+print("Running FAMD and showing cumulative percentage explained")
+```
+
+
+
+
+
+```{r FAMD_variance, echo = FALSE, eval=only_for_ADNI1}
+
+
+#doing twice for visualization
+k_all = ncol(input)
+FAMD_all <- FAMD(input, graph = FALSE, ncp = k_all) #ncp = 5 is default
+
+
+eig.val <- get_eigenvalue(FAMD_all)
+eig.val
+
+eig.val <- as.data.frame(eig.val)
+
+
+FAMD_variance <- get_famd_var(FAMD_all)
+```
+
+```{r famd_scree, echo = FALSE, eval=only_for_ADNI1}
+# percentage explained per component
+fviz_eig(FAMD_all, addlabels = TRUE)
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+# cumulative explained variance
+total_FAMD_var <- eig.val
+total_FAMD_var$component <- seq(1:nrow(total_FAMD_var))
+
+ggplot(total_FAMD_var, aes(x=component, y=cumulative.variance.percent))+
+  geom_col(fill="steelblue")+
+  geom_line(group=1)
+```
+
+
+
+```{r num_comps, echo = FALSE, eval=only_for_ADNI1}
+
+k <- min(which(eig.val$cumulative.variance.percent > FAMD_threshold))
+
+actul_cumulative_var <- eig.val$cumulative.variance.percent[k]
+res.famd <- FAMD(input, graph = FALSE, ncp = k) 
+
+```
+
+
+
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print(paste0("Number of components from FAMD to be used in clustering is: ", k, "\n"))
+
+print(paste0("Based on a minimum cumulative % variance explained of: ", FAMD_threshold, "\n"))
+
+print(paste0("With actual cumulative % variance being: ", round(actul_cumulative_var), "%", "\n"))
+
+```
+
+```{r clustering, include = FALSE, echo = FALSE, eval=only_for_ADNI1}
+
+kclust=-1; kmin=2 
+
+cluster_metric = "euclidean"
+cluster_method = "ward"
+
+res.hcpc <- HCPC(res.famd, nb.clust = kclust, graph = FALSE, min = kmin,
+                  metric=cluster_metric, method=cluster_method)
+cluster <- res.hcpc$data.clust$clust
+cluster <- factor(cluster)
+
+
+```
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("#  HCPC\\n")
+```
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("## Dendrogram\\n")
+
+print("Dendrogram of HCPC clustering using")
+```
+
+
+
+
+
+
+
+```{r, echo = FALSE, eval=only_for_ADNI1}
+
+
+
+##  Dendrogram
+dendro<-fviz_dend(res.hcpc,
+         cex = 0.7,                     # Label size
+         palette = "jco",               # Color palette see ?ggpubr::ggpar
+         rect = TRUE, rect_fill = TRUE, # Add rectangle around groups #cancel this if below is cancelled
+         rect_border = "jco",           # Rectangle color #if I cancel this out, the border is removed
+         #labels_track_height = 0.8      # Can Augment the room for labels (e.g. 0.8)
+         show_labels = FALSE
+)
+
+
+
+dendro
+
+```
+
+```{r, echo = FALSE, eval=only_for_ADNI1}
+table(cluster)
+```
+```{r, echo = FALSE, eval=only_for_ADNI1}
+cluster
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("## cluster map\\n")
+
+print("Showing the k-means cluster based on HCPC")
+```
+
+
+```{r, echo = FALSE, eval=only_for_ADNI1}
+# Individuals factor map
+PC_map<-fviz_cluster(res.hcpc, geom = "point", main = "Factor map")
+PC_map
+
+
+
+```
+
+
+```{r save_clusters, echo=FALSE, eval=only_for_ADNI1}
+
+if (save_cluster_results){
+  tmp <- cbind(cluster, data_orig)
+  write.csv(tmp, file=paste0(results_dir, "/d_all_FI_with_clusters.csv"), row.names=FALSE)
+
+  rm(tmp)
+}
+
+
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+
+knitr::asis_output("## Description of clusters by quantiative variables (uncorrected) \\n")
+```
+
+
+
+```{r, echo = FALSE, results='asis', eval=FALSE}
+
+
+input$cluster <-cluster
+clustexpl<-catdes(input,num.var=which(colnames(input)=="cluster"),proba=1) 
+
+
+quantiall<-as.data.frame(clustexpl$quanti.var)
+
+z=ztable(quantiall, caption="Quantitative variables that describe the most overall")
+z
+
+
+z=ztable(res.hcpc$desc.var$quanti$`1`, caption="Quantitative variables that describe the most in cluster 1")
+z
+
+
+z=ztable(res.hcpc$desc.var$quanti$`2`, caption="Quantitative variables that describe the most in cluster 2")
+z
+
+```
+
+
+
+```{r, echo=FALSE, eval=FALSE}
+knitr::asis_output("## Description of clusters by categorical variables (uncorrected)\\n")
+```
+
+
+
+
+```{r, echo = FALSE, results='asis', eval=FALSE}
+
+
+catall<-as.data.frame(clustexpl$test.chi2)
+
+z=ztable(catall, caption="Categorical variables that describe the most overall")
+z
+
+
+z=ztable(res.hcpc$desc.var$category$`1`, caption="Categorical variables that describe the most in cluster 1")
+z
+
+
+z=ztable(res.hcpc$desc.var$category$`2`, caption="Categorical variables that describe the most in cluster 2")
+z
+
+
+```
+
+```{r, echo=FALSE, eval=FALSE}
+knitr::asis_output("## Description of clusters by all FI variables (uncorrected)\\n")
+```
+
+
+```{r, echo = FALSE, results='asis', eval=FALSE}
+quantiall$Eta2<-NULL; catall$df<-NULL;
+colnames(quantiall)<-"p.value" #dataframes MUST have same variable names
+allvar<-rbind(catall,quantiall)
+allvar$p.value<-allvar[order(allvar$p.value),] #there is probably something here that is redundant
+allvar$adjp <- p.adjust(allvar$p.value, method="fdr")
+z=ztable(allvar, caption="Variables that describe the most overall")
+z
+
+```
+
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("## Description of clusters by principal components\\n")
+```
+
+
+`r if(only_for_ADNI1){
+ "Note: I am unsure if this is a mixture of quantitative and categorical variables,
+  <br>
+  or if this 'ranking' is just based on the quantitative variables."
+}`
+
+
+```{r, echo = FALSE, results='asis', eval=FALSE}
+
+z=ztable(res.hcpc$desc.axes$quanti$`2`, caption="Principal components that describe the most overall")
+z
+
+
+z=ztable(res.hcpc$desc.axes$quanti$`1`, caption="Principal compoents that describe the most in cluster 1")
+z
+
+
+z=ztable(res.hcpc$desc.axes$quanti$`2`, caption="Principal compoents that describe the most in cluster 2")
+z
+
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("## Description of clusters by quantitative FI variables\\n")
+```
+
+
+```{r, eval=only_for_ADNI1}
+
+print(paste0("corrected for", cluster_compare_glm_variables[2:length(cluster_compare_glm_variables)]))
+print("NOTE: it is rounded to 2 decimal points")
+```
+
+
+
+
+```{r data_all_clusters_FI_quanti, echo = FALSE, results='asis', eval=only_for_ADNI1}
+
+
+
+
+data_all$cluster<-cluster
+
+
+data_all$APOE4_use <-data_all$APOE4
+data_all$APOE4_use[data_all$APOE4_use == 2] <- 1
+
+
+
+input <- data_all %>% dplyr::select(names(cont))
+nFeatQuanti <- ncol(cont)
+
+#linear
+saveTval <- numeric()
+saveFval <- numeric()
+saveEta <- numeric()
+saveDval <- numeric()
+
+
+
+
+savePval <- numeric()
+
+
+
+for(k in 1:nFeatQuanti){
+  
+  tempvar<- input[,k]
+  
+
+  lm.out<-lm(cluster_compare_glm_formula, data=data_all)
+  stats<-summary(lm.out)
+  thelogit <- coefficients(stats)
+
+  saveTval[k]<- thelogit["cluster1","t value"] 
+  saveDval[k]<- computeCohenD(t=saveTval[k],df=stats$df[2]) 
+  savePval[k]<- thelogit["cluster1","Pr(>|t|)"]
+  
+
+}
+
+
+resultsdata_all_quanti <- as.data.frame(cbind(saveTval, saveDval, savePval)) #linear
+resultsdata_all_quanti$adjp <- p.adjust(resultsdata_all_quanti$savePval, method="fdr")
+resultsdata_all_quanti$FI_var <- colnames(cont)
+resultsdata_all_quanti<-resultsdata_all_quanti[order(resultsdata_all_quanti$savePval),]
+
+
+z=ztable(resultsdata_all_quanti, caption="Quantitative variables that describe the most overall for clusters")
+z
+
+
+
+```
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("## Description of clusters by categorical FI variables\\n")
+```
+
+```{r, eval=only_for_ADNI1}
+
+print(paste0("corrected for", cluster_compare_glm_variables[2:length(cluster_compare_glm_variables)]))
+print("NOTE: it is rounded to 2 decimal points")
+```
+
+
+
+```{r data_all_clusters_cat_FI, echo = FALSE, results='asis', eval=only_for_ADNI1}
+
+
+input <- data_all %>% dplyr::select(names(categorical))
+nFeatCateg<-ncol(categorical)
+
+save_test_val <- numeric()
+savePval <- numeric()
+
+for(k in 1:nFeatCateg){
+  tempvar<- input[,k]
+  
+  if (nlevels(tempvar) == 2){
+
+    glm_res <- glm(cluster_compare_glm_formula, family=binomial (link='logit'), data=data_all) #parametrizable
+    
+    stats<-summary(glm_res)
+    coef_stats <- coefficients(stats)
+    
+    save_test_val[k]<- coef_stats["cluster1","z value"] 
+    savePval[k]<- coef_stats["cluster1","Pr(>|z|)"] 
+  
+  } else if (nlevels(tempvar) > 2){
+    
+    glm_res <- MASS::polr(cluster_compare_glm_formula, data=data_all, Hess=TRUE) #ordinal logistic
+
+    coef_stats <- Anova(glm_res, type="III")
+
+    save_test_val[k]<- coef_stats["cluster","Pr(>Chisq)"]
+    savePval[k]<- coef_stats["cluster","Pr(>Chisq)"]
+    
+  }
+  
+  
+  
+
+}
+
+resultsdata_all_categ <- as.data.frame(cbind(save_test_val, savePval))
+resultsdata_all_categ$adjp <- p.adjust(resultsdata_all_categ$savePval, method="fdr")
+resultsdata_all_categ$FI_var <- colnames(categorical)
+resultsdata_all_categ<-resultsdata_all_categ[order(resultsdata_all_categ$savePval),]
+
+
+
+z=ztable(resultsdata_all_categ, caption="Categorical variables that describe the most overall for clusters")
+z
+
+
+```
+
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("## Description of clusters by all FI variables\\n")
+```
+
+```{r, eval=only_for_ADNI1, echo=FALSE}
+
+print("In descending order, FDR corrected")
+print(paste0("corrected for", cluster_compare_glm_variables[2:length(cluster_compare_glm_variables)]))
+print("NOTE: it is rounded to 2 decimal points")
+```
+
+
+```{r clusters_all_FI, echo = FALSE, results='asis', eval=only_for_ADNI1}
+
+
+resultsdata_all_var<- resultsdata_all_categ %>%  dplyr::select(FI_var, savePval)
+tmp <- resultsdata_all_quanti %>% dplyr::select(FI_var, savePval)
+resultsdata_all_var<-rbind(resultsdata_all_var,tmp)
+resultsdata_all_var$adjp <- p.adjust(resultsdata_all_var$savePval, method="fdr")
+resultsdata_all_var<-resultsdata_all_var[order(resultsdata_all_var$savePval),]
+
+z=ztable(resultsdata_all_var, caption="Variables that describe the most overall for clusters")
+z
+
+
+
+```
+FI variables with adjusted p value < 0.05
+
+```{r, echo = FALSE, eval=only_for_ADNI1}
+resultsdata_all_var %>% 
+  filter(adjp < 0.05)
+```
+
+
+```{r open_FI_list, echo=FALSE, eval=only_for_ADNI1}
+
+if (add_new_FI_to_list | recompute_FI_refined_loop){
+  
+  refined_FI_list <- resultsdata_all_var %>% 
+    filter(adjp < 0.05) %>% 
+    pull(FI_var)
+
+  refined_FI_list <- stringr::str_remove(refined_FI_list, "_binarized") #remove from FAQ variables
+  refined_FI_list <- paste0(refined_FI_list, "_binarized")
+  
+  all_FI_list <- read.csv(paste0(wd, "/list_frailty_indices.csv"))
+
+  all_FI_list[,chosen_FI_refined] <- 0
+  
+  # 1's for variables that meet new FI refined criteria
+  for (FI_var in refined_FI_list){
+    
+    FI_var_index <- which(all_FI_list$variable == FI_var)
+    all_FI_list[,chosen_FI_refined][FI_var_index] <- 1
+  }
+  
+
+  write.table(all_FI_list, file = file.path(wd, "list_frailty_indices.csv"), row.names = F, col.names = T, sep = ",")
+  print("--------clustering script stopped early to compute new refined FI--------")
+  knitr::knit_exit()
+} 
+
+
+
+
+```
+
+
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("## Description of MCI clusters by quantiative FI variables\\n")
+```
+
+`r if(only_for_ADNI1){
+  "corrected for age, sex, education
+  <br>
+  NOTE: it is rounded to 2 decimal points"
+}`
+
+
+```{r MCI_clusters_FI_quanti, echo = FALSE, results='asis', eval=only_for_ADNI1}
+
+
+
+MCI <- data_all %>% filter(Dx == "MCI")
+input <- MCI %>% dplyr::select(names(cont))
+nFeatQuanti <- ncol(cont)
+
+saveTval <- numeric()
+saveFval <- numeric()
+saveEta <- numeric()
+saveDval <- numeric()
+savePval <- numeric()
+
+
+
+for(k in 1:nFeatQuanti){
+  
+  tempvar<- input[,k]
+  
+
+
+  lm.out<-lm(tempvar ~ cluster + Age + Sex + PTEDUCAT, data=MCI)
+
+  stats<-summary(lm.out)
+  thelogit <- coefficients(stats)
+  
+
+  saveTval[k]<- thelogit["cluster1","t value"] 
+  saveDval[k]<- computeCohenD(t=saveTval[k],df=stats$df[2]) 
+  savePval[k]<- thelogit["cluster1","Pr(>|t|)"] 
+  
+
+}
+
+
+resultsMCI_quanti <- as.data.frame(cbind(saveTval, saveDval, savePval))
+resultsMCI_quanti$adjp <- p.adjust(resultsMCI_quanti$savePval, method="fdr")
+resultsMCI_quanti$FI_var <- colnames(cont)
+resultsMCI_quanti<-resultsMCI_quanti[order(resultsMCI_quanti$savePval),]
+
+
+z=ztable(resultsMCI_quanti, caption="Quantitative variables that describe the most overall for MCI clusters")
+z
+
+
+
+```
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("## Description of MCI clusters by categorical FI variables\\n")
+```
+
+`r if(only_for_ADNI1){
+  "corrected for age, sex, education
+  <br>
+  NOTE: it is rounded to 2 decimal points"
+}`
+
+
+```{r MCI_clusters_cat_FI, echo = FALSE, results='asis', eval=only_for_ADNI1}
+
+
+
+
+
+
+input <- MCI %>% dplyr::select(names(categorical))
+nFeatCateg<-ncol(categorical)
+
+saveZval <- numeric()
+savePval <- numeric()
+
+for(k in 1:nFeatCateg){
+  tempvar<- input[,k]
+  
+  logistic <- glm(cluster ~ tempvar + Age + Sex + PTEDUCAT, family=binomial (link='logit'), data=MCI)
+
+  names(logistic$coefficients)<-c("(intercept)","tempvar","Age","SexMale","PTEDUCAT")
+  stats<-summary(logistic)
+  thelogit <- coefficients(stats)
+  
+  saveZval[k]<- thelogit["tempvar","z value"] 
+  savePval[k]<- thelogit["tempvar","Pr(>|z|)"] 
+
+}
+
+resultsMCI_categ <- as.data.frame(cbind(saveZval, savePval))
+resultsMCI_categ$adjp <- p.adjust(resultsMCI_categ$savePval, method="fdr")
+resultsMCI_categ$FI_var <- colnames(categorical)
+resultsMCI_categ<-resultsMCI_categ[order(resultsMCI_categ$savePval),]
+
+
+
+z=ztable(resultsMCI_categ, caption="Categorical variables that describe the most overall for MCI clusters")
+z
+
+
+```
+
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("## Description of MCI clusters by all FI variables\\n")
+```
+
+`r if(only_for_ADNI1){
+  "Clustering on all subjects (HC, MCI, AD), but only comparing the MCI
+  (i.e. MCI-C1 vs MCI-C2)
+
+  In descending order, FDR corrected
+  corrected for age, sex, education
+  <br>
+  NOTE: it is rounded to 2 decimal points"
+
+}`
+
+```{r MC_clusters_all_FI, echo = FALSE, results='asis', eval=only_for_ADNI1}
+
+
+resultsMCI_var<- resultsMCI_categ %>%  dplyr::select(FI_var, savePval)
+tmp <- resultsMCI_quanti %>% dplyr::select(FI_var, savePval)
+resultsMCI_var<-rbind(resultsMCI_var,tmp)
+resultsMCI_var$adjp <- p.adjust(resultsMCI_var$savePval, method="fdr")
+resultsMCI_var<-resultsMCI_var[order(resultsMCI_var$savePval),]
+
+z=ztable(resultsMCI_var, caption="Variables that describe the most overall for MCI clusters")
+z
+
+
+
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("# FAMD variables (plot)\\n")
+```
+
+
+
+```{r FAMD_plot, echo = FALSE, fig.width = 20, fig.height = 6, eval=only_for_ADNI1}
+
+tmp <- get_famd_var(res.famd)
+FAMD_vars<-as.data.frame(tmp$contrib)
+
+FAMD_vars <- as.data.frame(add_rownames(FAMD_vars, "FI_variables")) 
+
+PCs_in_plot <- paste0("Dim.", seq(1:num_PCs_plot))
+
+FAMD_plot <- FAMD_vars %>% 
+  dplyr::select(FI_variables, one_of(PCs_in_plot))
+
+
+names(FAMD_plot)<-c("FI_variables", paste0("PC", seq(1:num_PCs_plot)))
+FAMD_plot_melt<-melt(FAMD_plot)
+names(FAMD_plot_melt)<-c("FI_variables","PC","value")
+
+ggplot(data=FAMD_plot_melt,mapping=aes(x=FI_variables, y=reorder(PC, desc(PC))))+ 
+  geom_tile(aes(fill=value))+
+  geom_text(aes(label = round(value, 1)),size=2.5)+ 
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red")+ 
+  theme_bw()+ 
+  theme(panel.grid=element_blank(), panel.border=element_blank())+ 
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))+ 
+  labs(title="FI variables",
+       y="FAMD principal components",
+       x="",
+       fill="% contribution")
+
+
+```
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("# FAMD quantitative varibles (plot)\\n")
+```
+
+
+```{r FAMD_quanti_plot, echo = FALSE, fig.width = 8, fig.height = 5, eval=only_for_ADNI1}
+
+FAMD_quanti<-as.data.frame(res.famd$quanti.var)
+
+
+FAMD_quanti <- as.data.frame(add_rownames(FAMD_quanti, "FI_variables"))
+
+PCs_in_plot <- paste0("contrib.Dim.", seq(1:num_PCs_plot))
+
+FAMD_quanti_plot <- FAMD_quanti %>% 
+  dplyr::select(FI_variables, one_of(PCs_in_plot))
+
+names(FAMD_quanti_plot)<-c("FI_variables", paste0("PC", seq(1:num_PCs_plot)))
+
+FAMD_quanti_melt<-melt(FAMD_quanti_plot)
+names(FAMD_quanti_melt)<-c("FI_variables","PC","value")
+
+
+
+ggplot(data=FAMD_quanti_melt,mapping=aes(x=FI_variables, y=reorder(PC, desc(PC))))+ 
+  geom_tile(aes(fill=value))+
+  geom_text(aes(label = round(value, 1)),size=2.5)+ 
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red")+ 
+  theme_bw()+ 
+  theme(panel.grid=element_blank(), panel.border=element_blank())+ 
+  coord_flip()+
+  labs(title="Continuous health variables",
+       y="FAMD principal components",
+       x="",
+       "correlation b/w item and PC",
+       fill="% contribution")
+
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("# FAMD qualitative variables (plot)\\n")
+```
+
+
+```{r FAMD_quali_plot, echo = FALSE, fig.width = 8, fig.height = 10, eval=only_for_ADNI1}
+
+FAMD_quali <- FAMD_vars %>% 
+  dplyr::filter(FI_variables %in%(cat_cols))
+
+
+PCs_in_plot <- paste0("Dim.", seq(1:num_PCs_plot))
+
+FAMD_quali_plot <- FAMD_quali %>% 
+  dplyr::select(FI_variables, one_of(PCs_in_plot))
+
+names(FAMD_quali_plot)<-c("FI_variables", paste0("PC", seq(1:num_PCs_plot)))
+
+FAMD_quali_melt<-melt(FAMD_quali_plot)
+names(FAMD_quali_melt)<-c("FI_variables","PC","value")
+
+
+
+ggplot(data=FAMD_quali_melt,mapping=aes(x=FI_variables, y=reorder(PC, desc(PC))))+
+  geom_tile(aes(fill=value))+
+  geom_text(aes(label = round(value, 1)),size=2.5)+ 
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red")+ 
+  theme_bw()+ 
+  theme(panel.grid=element_blank(), panel.border=element_blank())+ 
+  coord_flip()+
+  labs(title="Categorical health variables",
+       y="FAMD principal components",
+       x="",
+       "correlation b/w item and PC",
+       fill="% contribution")
+
+```
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("# Dx distribution\\n")
+```
+
+
+
+
+```{r dx_distrib, echo = FALSE, eval=only_for_ADNI1}
+demogr<-data.frame(cluster) 
+data_all$cluster <- demogr$cluster
+
+
+clust1_plot <- data_all %>% 
+  filter(cluster == "1") %>% 
+  ggplot(aes(x=factor(1), fill=Dx))+
+  geom_bar(position="dodge")+
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())+
+  labs(x="cluster1", 
+       y="count")
+
+clust2_plot <- data_all %>% 
+  filter(cluster == "2") %>% 
+  ggplot(aes(x=factor(1), fill=Dx))+
+  geom_bar(position="dodge")+
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())+
+  labs(x="cluster 2", 
+       y="")
+
+
+
+HC_clusters <- data_all %>% 
+  filter(Dx=="HC") %>% 
+  dplyr::select(cluster) %>% 
+  pull()
+
+
+
+HC_clusters <- factor(HC_clusters)
+
+
+if (length(levels(HC_clusters)) == 1){
+
+  
+  print(clust1_plot)
+  
+  print(clust2_plot)
+  
+} else {
+  
+
+  clust1_plot <- clust1_plot + 
+    theme(legend.position="None")
+  
+  clust2_plot <- clust2_plot +
+    theme(legend.position="None")
+  
+  
+  test<-data_all %>% 
+    filter(cluster == "1") %>% 
+    ggplot(aes(x=factor(1), fill=Dx))+
+    geom_bar(position="dodge")+
+    theme(axis.text.x=element_blank(),
+          axis.ticks.x=element_blank())+
+    labs(x="", 
+         y="cluster 1")
+  
+  legend <- get_legend(test)
+
+  
+  plot_grid(clust1_plot, clust2_plot, legend, 
+          nrow = 1, labels = c("A","B"), 
+          rel_widths=c(4,4,1)) 
+}
+
+
+
+plot.lab<-c("cluster 1", "cluster 2")
+
+ggplot(data_all,aes(x=as.factor(cluster), fill=Dx))+
+  geom_bar() +
+  scale_x_discrete(labels=plot.lab)+ 
+  labs(x="")
+         
+
+
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("# Sex distribution\\n")
+```
+
+
+```{r, echo = FALSE, eval=only_for_ADNI1}
+
+# Edit depending on number of clusters
+
+data_all %>% 
+  filter(cluster == "1") %>% 
+  ggplot(aes(x=factor(1), fill=Sex))+
+  geom_bar(width = 1)+
+  coord_polar("y")+
+  theme(panel.grid=element_blank())+ 
+  theme(axis.ticks = element_blank())+ 
+  theme(plot.title=element_text(size=14, face="bold"))+#uh...
+  labs(x="", 
+       y="cluster 1")
+
+data_all %>% 
+  filter(cluster == "2") %>% 
+  ggplot(aes(x=factor(1), fill=Sex))+
+  geom_bar(width = 1)+
+  coord_polar("y")+
+  theme(panel.grid=element_blank())+ 
+  theme(axis.ticks = element_blank())+ 
+  theme(plot.title=element_text(size=14, face="bold"))+
+  labs(x="", 
+       y="cluster 2")
+
+
+
+
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("# Age distributions\\n")
+```
+
+```{r age_distrib, echo = FALSE, eval=only_for_ADNI1}
+
+
+
+
+ggplot(data_all, aes(Age, fill = as.character(cluster), color = as.character(cluster))) + 
+  geom_density(alpha = 0.4, size = 1)+
+  labs(title = "",
+       fill = "Cluster", color = "Cluster") 
+
+
+data_all %>% 
+  filter(cluster == "1") %>% 
+  ggplot(aes(Age, fill = as.character(Dx), color = as.character(Dx))) + 
+  geom_density(alpha = 0.4, size = 1)+
+  labs(title = "cluster 1",
+       fill = "Dx", color = "Dx") 
+
+data_all %>% 
+  filter(cluster=="2") %>% 
+  ggplot(aes(Age, fill = as.character(Dx), color = as.character(Dx))) + 
+  geom_density(alpha = 0.4, size = 1)+
+  labs(title = "cluster 2",
+       fill = "Dx", color = "Dx")
+
+
+```
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("# Table of descriptives\\n")
+```
+
+
+```{r, echo = FALSE, messages = FALSE, eval=only_for_ADNI1}
+
+tmp_all<-data_all %>% 
+  dplyr::select(cluster, Age, Sex, PTEDUCAT, MMSE, CDRSB, FI_standard)  
+
+res=mytable(cluster~.,data=tmp_all,method=3) 
+res
+
+
+```
+
+
+
+
+
+
+# Classification
+
+Classifying Dx (binary and multiclass classification)
+<br>
+1) normal FI
+<br>
+2) refined FI
+<br>
+using Linear discriminant analysis (LDA) from package `discrim`
+<br>
+
+`r if(only_for_ADNI1){
+  "and cross-validation from tidymodels"
+}`
+
+
+```{r cv_prep, echo=FALSE}
+
+run_cv_all <- function(data, Dx_groups = "HC and AD",  nfolds=10, nrep=100,
+                       include_Canevelli = FALSE,
+                       seed=123, verbose=TRUE){
+  
+  require(dplyr)
+  
+  if (Dx_groups=="HC and AD") take_away <- "MCI"
+  if (Dx_groups=="MCI and AD") take_away <- "HC"
+  if (Dx_groups=="HC and MCI") take_away <- "AD"
+  
+  # unique for binary classification
+  data <- data %>% 
+    filter(Dx != take_away)
+  
+  #get rid of empty factor
+  data$Dx <- factor(data$Dx)
+  
+  metrics <- metric_set(accuracy, bal_accuracy, roc_auc,
+                        sens, spec, precision, recall)
+  
+
+  
+  if (!include_Canevelli) {
+    data <- data %>% 
+      dplyr::select(Dx, FI_standard, FI_refined)
+  } else {
+    data <- data %>% 
+      dplyr::select(Dx, FI_standard, FI_refined, FI_Canevelli)
+  }
+  
+  
+  
+  
+  lda_spec <-
+    discrim_linear() %>%
+    set_engine("mda")
+  
+  set.seed(seed)
+  folds <- vfold_cv(data, v = nfolds, repeats = nrep, strata=Dx)
+  
+  
+  
+  FI_standard_rec <- 
+    recipe(Dx ~ FI_standard, data=data)
+  
+  FI_refined_rec <- 
+    recipe(Dx ~ FI_refined, data=data)
+  
+  if (include_Canevelli) {
+    FI_Canevelli_rec <- 
+      recipe(Dx ~ FI_Canevelli, data=data)
+  }
+  
+  if (!include_Canevelli){
+    model_list <-
+      list(FI_standard = FI_standard_rec,
+           FI_refined = FI_refined_rec
+      )
+  } else {
+    model_list <-
+      list(FI_standard = FI_standard_rec,
+           FI_refined = FI_refined_rec,
+           FI_Canevelli = FI_Canevelli_rec
+      )
+  }
+  
+  
+  lda_workflows <-
+    workflow_set(
+      preproc = model_list,
+      cross = FALSE, 
+      models = list(lda = lda_spec)
+      
+    )
+  
+  
+  keep_pred <- control_resamples(save_pred = TRUE)
+  
+  lda_models <-
+      lda_workflows %>% 
+      workflow_map("fit_resamples", resamples = folds,
+                   seed = seed,
+                   verbose = verbose,
+                   control = keep_pred, 
+                   metrics = metrics)  
+
+  
+  return(lda_models)
+
+}
+```
+
+```{r, echo=FALSE}
+
+get_classification_metrics <- function(lda_model, feature="FI_standard_lda"){
+  
+  lda_res <- lda_model %>% 
+    collect_metrics() %>% 
+    dplyr::select(-c(.config, preproc, model)) %>% 
+    filter(wflow_id == feature)
+  
+  
+  
+  # calculate standard deviation based on MEAN result
+  # for EACH repetition
+  lda_sd <- lda_model %>% 
+    collect_metrics(summarize=FALSE) %>% 
+    dplyr::select(-c(.config, preproc, model)) %>% 
+    filter(wflow_id == feature) %>% 
+    dplyr::select(-c(id2)) %>% 
+    group_by(.metric, id) %>% 
+    summarise(rep_result = mean(.estimate)) %>% 
+    ungroup() %>% 
+    group_by(.metric) %>% 
+    summarise(SD = sd(rep_result, na.rm = TRUE))
+  
+  
+  
+  
+  metrics <- lda_sd$.metric
+  
+  lda_CI <- lda_sd
+  lda_CI$low_95 <- NA
+  lda_CI$upper_95 <- NA
+  lda_CI$low_95 <- as.numeric(lda_CI$low_95)
+  lda_CI$upper_95 <- as.numeric(lda_CI$upper_95)
+  lda_CI$SD <- NULL
+  
+
+  for (chosen_metric in metrics){
+    
+
+    estimated_CI <- tryCatch({
+        lda_model %>% 
+        collect_metrics(summarize=FALSE) %>% 
+        dplyr::select(-c(.config, preproc, model)) %>% 
+        filter(wflow_id == feature) %>% 
+        filter(.metric == chosen_metric) %>% 
+        dplyr::select(-c(id2)) %>% 
+        group_by(id) %>% 
+        summarise(rep_result = mean(.estimate)) %>% 
+        ungroup() %>% 
+        get_confidence_interval(level=0.95)
+    }, 
+    error=function(e){
+      cat("ERROR :", conditionMessage(e), "\n")
+      })
+    
+    if(!is.null(estimated_CI)){
+      lda_CI[which(lda_CI$.metric == chosen_metric), 2:3] <- estimated_CI
+    }
+    
+    
+    
+    
+  }
+  
+  lda_res<- cbind(lda_res, "SD"= lda_sd$SD, 
+                  "low_95" = lda_CI$low_95, 
+                  "high_95" = lda_CI$upper_95)
+  
+  return(lda_res)
+  
+}
+```
+
+
+```{r, echo=FALSE}
+
+stat_compare_auc <- function(lda_models, compare_Canevelli=FALSE){
+  
+  auc_estimates <-
+    collect_metrics(lda_models, summarize = FALSE) %>% 
+    filter(.metric =="roc_auc")
+  
+  auc_wider <-
+    auc_estimates %>% 
+    dplyr::select(wflow_id, .estimate, id, id2) %>% 
+    pivot_wider(id_cols = c("id", "id2"), names_from = "wflow_id", values_from = ".estimate")
+  
+  
+  auc_wider <- auc_wider %>% 
+    dplyr::select(-c(id2)) %>% 
+    group_by(id) %>% 
+    summarise(across(everything(), list(mean)))
+  
+  if (ncol(auc_wider)==2){
+    names(auc_wider) <- c("id", "FI_standard_lda", "FI_refined_lda")
+  } else {
+    names(auc_wider) <- c("id", "FI_standard_lda", "FI_refined_lda", "FI_Canevelli_lda")
+  }
+  
+  
+  
+  
+
+  
+  if (!compare_Canevelli){
+    auc_comparison <- auc_wider %>% 
+      with( t.test(FI_standard_lda, FI_refined_lda, paired = TRUE)) %>% 
+      tidy() %>% 
+      dplyr::select(-c(parameter)) %>% 
+      rename(mean_diff = estimate,
+             t_value = statistic)
+  } else {
+    auc_comparison <- auc_wider %>% 
+      with( t.test(FI_Canevelli_lda, FI_refined_lda, paired = TRUE)) %>% 
+      tidy() %>% 
+      dplyr::select(-c(parameter)) %>% 
+      rename(mean_diff = estimate,
+             t_value = statistic)
+  }
+  
+  return(auc_comparison)
+}
+
+```
+
+
+## Binary Classification
+
+```{r save_bin_models, warning=FALSE, echo=FALSE, eval=only_for_ADNI1}
+lda_spec <- discrim_linear() %>%
+  set_engine("mda")
+
+lda_orig_wf <- 
+  workflow() %>%
+  add_model(lda_spec) %>%
+  add_formula(Dx ~ FI_standard)
+
+lda_refined_wf <- 
+  workflow() %>%
+  add_model(lda_spec) %>%
+  add_formula(Dx ~ FI_refined)
+
+if (include_Canevelli){
+  lda_Canevelli_wf <- 
+    workflow() %>%
+    add_model(lda_spec) %>%
+    add_formula(Dx ~ FI_Canevelli)
+}
+
+
+## HC and AD
+HC_and_AD_data <- data_all %>% 
+  filter(Dx != "MCI") 
+
+HC_and_AD_data$Dx <- factor(HC_and_AD_data$Dx)
+
+lda_orig_HC_and_AD <- 
+  lda_orig_wf %>% 
+  fit(data=HC_and_AD_data) 
+  
+
+lda_refined_HC_and_AD <- 
+  lda_refined_wf %>% 
+  fit(data=HC_and_AD_data) 
+
+if (include_Canevelli){
+  lda_Canevelli_HC_and_AD <- 
+    lda_Canevelli_wf %>% 
+    fit(data=HC_and_AD_data) 
+}
+### MCI and AD
+MCI_and_AD_data <- data_all %>% 
+  filter(Dx != "HC") 
+
+MCI_and_AD_data$Dx <- factor(MCI_and_AD_data$Dx)
+
+
+lda_orig_MCI_and_AD <- 
+  lda_orig_wf %>% 
+  fit(data=MCI_and_AD_data) 
+  
+
+lda_refined_MCI_and_AD <-
+  lda_refined_wf %>% 
+  fit(data=MCI_and_AD_data) 
+
+if (include_Canevelli){
+  lda_Canevelli_MCI_and_AD <-
+    lda_Canevelli_wf %>% 
+    fit(data=MCI_and_AD_data) 
+
+}
+
+## HC and MCI
+HC_and_MCI_data <- data_all %>% 
+  filter(Dx != "AD") 
+
+HC_and_MCI_data$Dx <- factor(HC_and_MCI_data$Dx)
+
+lda_orig_HC_and_MCI <-
+  lda_orig_wf %>% 
+  fit(data=HC_and_MCI_data) 
+  
+
+lda_refined_HC_and_MCI <-
+  lda_refined_wf %>% 
+  fit(data=HC_and_MCI_data) 
+
+if (include_Canevelli){
+  lda_Canevelli_HC_and_MCI <-
+    lda_Canevelli_wf %>% 
+    fit(data=HC_and_MCI_data)
+}
+
+### Save models
+saveRDS(lda_orig_HC_and_AD, file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_AD.RDS"))
+saveRDS(lda_orig_MCI_and_AD, file=file.path(wd, "intermediate_files/ML_models/lda_orig_MCI_and_AD.RDS"))
+saveRDS(lda_orig_HC_and_MCI, file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_MCI.RDS"))
+
+
+
+saveRDS(lda_refined_HC_and_AD, file=file.path(wd, paste0("intermediate_files/ML_models/lda_refined_HC_and_AD_", ML_name, ".RDS")))
+saveRDS(lda_refined_MCI_and_AD, file=file.path(wd, paste0("intermediate_files/ML_models/lda_refined_MCI_and_AD_", ML_name, ".RDS")))
+saveRDS(lda_refined_HC_and_MCI, file=file.path(wd, paste0("intermediate_files/ML_models/lda_refined_HC_and_MCI_", ML_name, ".RDS")))
+
+
+if(include_Canevelli){
+  saveRDS(lda_Canevelli_HC_and_AD, file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_AD.RDS"))
+  saveRDS(lda_Canevelli_MCI_and_AD, file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_MCI_and_AD.RDS"))
+  saveRDS(lda_Canevelli_HC_and_MCI, file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_MCI.RDS"))
+}
+```
+
+```{r load_bin_models, echo=FALSE, eval=only_for_ADNI2}
+
+lda_orig_HC_and_AD <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_AD.RDS"))
+lda_orig_MCI_and_AD <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_orig_MCI_and_AD.RDS"))
+lda_orig_HC_and_MCI <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_MCI.RDS"))
+
+
+lda_refined_HC_and_AD <- readRDS(file=file.path(wd, paste0("intermediate_files/ML_models/lda_refined_HC_and_AD_", ML_name, ".RDS")))
+lda_refined_MCI_and_AD <- readRDS(file=file.path(wd, paste0("intermediate_files/ML_models/lda_refined_MCI_and_AD_", ML_name, ".RDS")))
+lda_refined_HC_and_MCI <- readRDS(file=file.path(wd, paste0("intermediate_files/ML_models/lda_refined_HC_and_MCI_", ML_name, ".RDS")))
+
+
+if(include_Canevelli){
+  lda_Canevelli_HC_and_AD <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_AD.RDS"))
+  lda_Canevelli_MCI_and_AD <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_MCI_and_AD.RDS"))
+  lda_Canevelli_HC_and_MCI <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_MCI.RDS"))
+}
+
+
+HC_and_AD_standard <- data_all %>% 
+  filter(Dx != "MCI") %>% 
+  dplyr::select(Dx, FI_standard)
+
+HC_and_AD_refined <- data_all %>% 
+  filter(Dx != "MCI") %>% 
+  dplyr::select(Dx, FI_refined)
+
+MCI_and_AD_standard <- data_all %>% 
+  filter(Dx != "HC") %>% 
+  dplyr::select(Dx, FI_standard)
+
+MCI_and_AD_refined <- data_all %>% 
+  filter(Dx != "HC") %>% 
+  dplyr::select(Dx, FI_refined)
+
+HC_and_MCI_standard <- data_all %>% 
+  filter(Dx != "AD") %>% 
+  dplyr::select(Dx, FI_standard)
+
+HC_and_MCI_refined <- data_all %>% 
+  filter(Dx != "AD") %>% 
+  dplyr::select(Dx, FI_refined)
+
+
+if(include_Canevelli){
+  
+  HC_and_AD_Canevelli <- data_all %>% 
+    filter(Dx != "MCI") %>% 
+    dplyr::select(Dx, FI_Canevelli)
+
+
+  MCI_and_AD_Canevelli <- data_all %>% 
+    filter(Dx != "HC") %>% 
+    dplyr::select(Dx, FI_Canevelli)
+  
+  
+  HC_and_MCI_Canevelli <- data_all %>% 
+    filter(Dx != "AD") %>% 
+    dplyr::select(Dx, FI_Canevelli)
+
+
+  
+}
+```
+
+```{r run_bin_cv, echo=FALSE, warning=FALSE, message=FALSE, eval=only_for_ADNI1}
+HC_AD_lda <- run_cv_all(data_all, Dx_groups = "HC and AD",  nfolds=nfolds, nrep=nrep,
+                        include_Canevelli = include_Canevelli,
+                        seed=123, verbose=FALSE)
+
+MCI_AD_lda <- run_cv_all(data_all, Dx_groups = "MCI and AD",  nfolds=nfolds, nrep=nrep,
+                         include_Canevelli = include_Canevelli,
+                         seed=123, verbose=FALSE)
+
+HC_MCI_lda <- run_cv_all(data_all, Dx_groups = "HC and MCI",  nfolds=nfolds, nrep=nrep,
+                         include_Canevelli = include_Canevelli,
+                         seed=123, verbose=FALSE)
+
+```
+
+
+
+
+### HC vs AD
+
+
+#### Standard FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_standard_res <- get_classification_metrics(HC_AD_lda, feature="FI_standard_lda") 
+knitr::kable(HC_AD_cv_standard_res)
+
+```
+```{r, echo=FALSE, results='hide', message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_flex <- df2flextable(as.data.frame(HC_AD_cv_standard_res), digits=5)
+  table2docx(HC_AD_cv_res_flex, title = "Classification: HC vs AD using standard FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_standard_FI"))
+}
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+HC_AD_standard_res <- evaluate_ML_final(lda_model = lda_orig_HC_and_AD, 
+                                        FI_dataframe = HC_and_AD_standard,
+                                        Dx_groups = "HC and AD")
+knitr::kable(HC_AD_standard_res)
+
+```
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_flex <- df2flextable(as.data.frame(HC_AD_standard_res), digits=5)
+  table2docx(HC_AD_res_flex, title = "Classification: HC vs AD using standard FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_standard_FI"))
+}
+
+```
+
+#### Refined FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_refined_res  <- get_classification_metrics(HC_AD_lda, feature="FI_refined_lda")
+knitr::kable(HC_AD_cv_refined_res)
+
+```
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_flex <- df2flextable(as.data.frame(HC_AD_cv_refined_res), digits=5)
+  table2docx(HC_AD_cv_res_flex, title = "Classification: HC vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_refined_FI"))
+}  
+```
+
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+HC_AD_refined_res <- evaluate_ML_final(lda_model = lda_refined_HC_and_AD, 
+                                       FI_dataframe = HC_and_AD_refined,
+                                       Dx_groups = "HC and AD")
+knitr::kable(HC_AD_refined_res)
+```
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_flex <- df2flextable(as.data.frame(HC_AD_refined_res), digits=5)
+  table2docx(HC_AD_res_flex, title = "Classification: HC vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_refined_FI"))
+}
+
+```
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_Canevelli_res  <- get_classification_metrics(HC_AD_lda, feature="FI_Canevelli_lda")
+knitr::kable(HC_AD_cv_Canevelli_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+if (save_ML_table){
+  HC_AD_cv_res_flex <- df2flextable(as.data.frame(HC_AD_cv_Canevelli_res), digits=5)
+  table2docx(HC_AD_cv_res_flex, title = "Classification: HC vs AD using Canevelli FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_Canevelli_FI"))
+}  
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+print("Results from classifying ADNI2/ADNIGO")
+HC_AD_Canevelli_res <- evaluate_ML_final(lda_model = lda_Canevelli_HC_and_AD, 
+                                       FI_dataframe = HC_and_AD_Canevelli,
+                                       Dx_groups = "HC and AD")
+knitr::kable(HC_AD_Canevelli_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2_Canevelli}
+
+if (save_ML_table){
+  HC_AD_res_flex <- df2flextable(as.data.frame(HC_AD_Canevelli_res), digits=5)
+  table2docx(HC_AD_res_flex, title = "Classification: HC vs AD using Canevelli FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_Canevelli_FI"))
+}
+```
+
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("#### Statistical comparison (t-test) of AUC\\n")
+
+```
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1}
+print("HC vs. AD: Statistical comparison (t-test) of AUC (standard vs refined FI)")
+
+HC_AD_lda_stats <- stat_compare_auc(HC_AD_lda)
+HC_AD_lda_stats
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, warning=FALSE, eval=only_for_ADNI1}
+
+if (save_ML_table){
+  HC_AD_lda_stats_flex <- df2flextable(HC_AD_lda_stats, digits=5)
+  table2docx(HC_AD_lda_stats_flex, 
+             title = "HC vs. AD: Statistical comparison (t-test) of AUC (standard vs refined FI)", 
+             target = paste0(results_dir, "/", chosen_FI_refined, 
+                             "/ADNI1_HC_vs_AD_classification_stats"))
+}  
+```
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1_Canevelli}
+print("HC vs. AD: Statistical comparison (t-test) of AUC (Canevelli vs refined FI)")
+
+HC_AD_lda_stats <- stat_compare_auc(HC_AD_lda, compare_Canevelli = TRUE)
+HC_AD_lda_stats
+
+```
+```{r, echo=FALSE, warning=FALSE, results="hide", message=FALSE,  eval=only_for_ADNI1_Canevelli}
+
+if (save_ML_table){
+  HC_AD_lda_stats_flex <- df2flextable(HC_AD_lda_stats, digits=5)
+  table2docx(HC_AD_lda_stats_flex, 
+             title = "HC vs. AD: Statistical comparison (t-test) of AUC (standard vs refined FI)", 
+             target = paste0(results_dir, "/", chosen_FI_refined, 
+                             "/ADNI1_HC_vs_AD_classification_stats_Canevelli"))
+}  
+```
+
+### MCI vs AD
+
+
+#### Standard FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+MCI_AD_cv_standard_res <- get_classification_metrics(MCI_AD_lda, feature="FI_standard_lda")
+knitr::kable(MCI_AD_cv_standard_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  MCI_AD_cv_res_flex <- df2flextable(as.data.frame(MCI_AD_cv_standard_res), digits=5)
+  table2docx(MCI_AD_cv_res_flex, title = "Classification: MCI vs AD using standard FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_MCI_AD_cv_standard_FI"))
+}
+```
+
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+MCI_AD_standard_res <- evaluate_ML_final(lda_model = lda_orig_MCI_and_AD, 
+                                         FI_dataframe = MCI_and_AD_standard,
+                                         Dx_groups = "MCI and AD")
+knitr::kable(MCI_AD_standard_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  MCI_AD_res_flex <- df2flextable(as.data.frame(MCI_AD_standard_res), digits=5)
+  table2docx(MCI_AD_res_flex, title = "Classification: MCI vs AD using standard FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_MCI_AD_standard_FI"))
+}
+
+```
+
+#### Refined FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+MCI_AD_cv_refined_res <- get_classification_metrics(MCI_AD_lda, feature="FI_refined_lda")
+knitr::kable(MCI_AD_cv_refined_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  MCI_AD_cv_res_flex <- df2flextable(as.data.frame(MCI_AD_cv_refined_res), digits=5)
+  table2docx(MCI_AD_cv_res_flex, title = "Classification: MCI vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_MCI_AD_cv_refined_FI"))
+}  
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+MCI_AD_refined_res <- evaluate_ML_final(lda_model = lda_refined_MCI_and_AD, 
+                                        FI_dataframe = MCI_and_AD_refined,
+                                        Dx_groups = "MCI and AD")
+knitr::kable(MCI_AD_refined_res)
+
+```
+
+```{r echo=FALSE, results = "hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  MCI_AD_res_flex <- df2flextable(as.data.frame(MCI_AD_refined_res), digits=5)
+  table2docx(MCI_AD_res_flex, title = "Classification: MCI vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_MCI_AD_refined_FI"))
+}
+
+```
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results (ADNI1)")
+MCI_AD_cv_Canevelli_res  <- get_classification_metrics(MCI_AD_lda, feature="FI_Canevelli_lda")
+knitr::kable(MCI_AD_cv_Canevelli_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+if (save_ML_table){
+  MCI_AD_cv_res_flex <- df2flextable(as.data.frame(MCI_AD_cv_Canevelli_res), digits=5)
+  table2docx(MCI_AD_cv_res_flex, title = "Classification: MCI vs AD using Canevelli FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_MCI_AD_cv_Canevelli_FI"))
+}  
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+print("Results from classifying ADNI2/ADNIGO")
+MCI_AD_Canevelli_res <- evaluate_ML_final(lda_model = lda_Canevelli_MCI_and_AD, 
+                                         FI_dataframe = MCI_and_AD_Canevelli,
+                                         Dx_groups = "MCI and AD")
+knitr::kable(MCI_AD_Canevelli_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2_Canevelli}
+
+if (save_ML_table){
+  MCI_AD_res_flex <- df2flextable(as.data.frame(MCI_AD_Canevelli_res), digits=5)
+  table2docx(MCI_AD_res_flex, title = "Classification: MCI vs AD using Canevelli FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_MCI_AD_Canevelli_FI"))
+}
+```
+
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("#### Statistical comparison (t-test) of AUC\\n")
+
+```
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+MCI_AD_lda_stats <- stat_compare_auc(MCI_AD_lda)
+MCI_AD_lda_stats
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  MCI_AD_lda_stats_flex <- df2flextable(MCI_AD_lda_stats, digits=5)
+  table2docx(HC_AD_lda_stats_flex, 
+             title = "MCI vs AD: Statistical comparison (t-test) of AUC", 
+             target = paste0(results_dir, "/", chosen_FI_refined, 
+                             "/ADNI1_MCI_vs_AD_classification_stats"))
+}  
+```
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1_Canevelli}
+print("MCI vs. AD: Statistical comparison (t-test) of AUC (Canevelli vs refined FI)")
+
+MCI_AD_lda_stats <- stat_compare_auc(MCI_AD_lda, compare_Canevelli = TRUE)
+MCI_AD_lda_stats
+
+```
+
+```{r, echo=FALSE, warning=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+
+if (save_ML_table){
+  MCI_AD_lda_stats_flex <- df2flextable(MCI_AD_lda_stats, digits=5)
+  table2docx(MCI_AD_lda_stats_flex, 
+             title = "MCI vs. AD: Statistical comparison (t-test) of AUC (standard vs refined FI)", 
+             target = paste0(results_dir, "/", chosen_FI_refined, 
+                             "/ADNI1_MCI_vs_AD_classification_stats_Canevelli"))
+}  
+```
+
+### HC vs MCI
+
+
+#### Standard FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_MCI_cv_standard_res <- get_classification_metrics(HC_MCI_lda, feature="FI_standard_lda")
+knitr::kable(HC_MCI_cv_standard_res)
+
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+
+if (save_ML_table){
+  HC_MCI_cv_res_flex <- df2flextable(as.data.frame(HC_MCI_cv_standard_res), digits=5)
+  table2docx(HC_MCI_cv_res_flex, title = "Classification: HC vs MCI using standard FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_MCI_cv_standard_FI"))
+}  
+```
+
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_MCI_standard_res <- evaluate_ML_final(lda_model = lda_orig_HC_and_MCI, 
+                                         FI_dataframe = HC_and_MCI_standard,
+                                         Dx_groups = "HC and MCI")
+knitr::kable(HC_MCI_standard_res)
+
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+
+if (save_ML_table){
+  HC_MCI_res_flex <- df2flextable(as.data.frame(HC_MCI_standard_res), digits=5)
+  table2docx(HC_MCI_res_flex, title = "Classification: HC vs MCI using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_MCI_standard_FI"))
+}
+
+```
+
+#### Refined FI
+
+```{r, echo = FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_MCI_cv_refined_res <- get_classification_metrics(HC_MCI_lda, feature="FI_refined_lda")
+knitr::kable(HC_MCI_cv_refined_res)
+
+
+```
+
+```{r, echo = FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+
+if (save_ML_table){
+  HC_MCI_cv_res_flex <- df2flextable(as.data.frame(HC_MCI_cv_refined_res), digits=5)
+  table2docx(HC_MCI_cv_res_flex, title = "Classification: HC vs MCI using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_MCI_cv_refined_FI"))
+}  
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_MCI_refined_res <- evaluate_ML_final(lda_model = lda_refined_HC_and_MCI, 
+                                        FI_dataframe = HC_and_MCI_refined,
+                                        Dx_groups = "HC and MCI")
+
+knitr::kable(HC_MCI_refined_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+
+if (save_ML_table){
+  HC_MCI_res_flex <- df2flextable(as.data.frame(HC_MCI_refined_res), digits=5)
+  table2docx(HC_MCI_res_flex, title = "Classification: HC vs MCI using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_MCI_refined_FI"))
+}
+
+```
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results (ADNI1)")
+HC_MCI_cv_Canevelli_res  <- get_classification_metrics(HC_MCI_lda, feature="FI_Canevelli_lda")
+knitr::kable(HC_MCI_cv_Canevelli_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+
+if (save_ML_table){
+  HC_MCI_cv_res_flex <- df2flextable(as.data.frame(HC_MCI_cv_Canevelli_res), digits=5)
+  table2docx(HC_MCI_cv_res_flex, title = "Classification: HC vs MCI using Canevelli FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_MCI_cv_Canevelli_FI"))
+}  
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+print("Results from classifying ADNI2/ADNIGO")
+HC_MCI_Canevelli_res <- evaluate_ML_final(lda_model = lda_Canevelli_HC_and_MCI, 
+                                         FI_dataframe = HC_and_MCI_Canevelli,
+                                         Dx_groups = "HC and MCI")
+knitr::kable(HC_MCI_Canevelli_res)
+
+```
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2_Canevelli}
+
+if (save_ML_table){
+  HC_MCI_res_flex <- df2flextable(as.data.frame(HC_MCI_Canevelli_res), digits=5)
+  table2docx(HC_MCI_res_flex, title = "Classification: HC vs MCI using Canevelli FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_MCI_Canevelli_FI"))
+}
+```
+
+
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("#### Statistical comparison (t-test) of AUC\\n")
+
+```
+
+
+```{r, echo = FALSE, eval=only_for_ADNI1}
+HC_MCI_lda_stats <- stat_compare_auc(HC_MCI_lda)
+HC_MCI_lda_stats
+
+
+```
+
+```{r, echo = FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+
+if (save_ML_table){
+  HC_MCI_lda_stats_flex <- df2flextable(HC_MCI_lda_stats, digits=5)
+  table2docx(HC_MCI_lda_stats_flex, 
+             title = "HC vs MCI: Statistical comparison (t-test) of AUC", 
+             paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_vs_MCI_classification_stats"))
+} 
+```
+
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1_Canevelli}
+print("HC vs. MCI: Statistical comparison (t-test) of AUC (Canevelli vs refined FI)")
+
+HC_MCI_lda_stats <- stat_compare_auc(HC_MCI_lda, compare_Canevelli = TRUE)
+HC_MCI_lda_stats
+
+```
+
+```{r, echo=FALSE, warning=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+
+if (save_ML_table){
+  HC_MCI_lda_stats_flex <- df2flextable(HC_MCI_lda_stats, digits=5)
+  table2docx(HC_MCI_lda_stats_flex, 
+             title = "HC vs. MCI: Statistical comparison (t-test) of AUC (standard vs refined FI)", 
+             target = paste0(results_dir, "/", chosen_FI_refined, 
+                             "/ADNI1_HC_vs_MCI_classification_stats_Canevelli"))
+}  
+```
+
+
+# Cox regression
+
+
+Note: Continuous frailty indices are multiplied by 100 for cox regression analyses
+<br>
+Filtering away baseline diagnosis HC and AD.
+<br>
+Survival analyses checks for conversion from MCI -> AD
+
+```{r cox_reg_prep, echo = FALSE, results='asis', warning=FALSE, message=FALSE}
+
+
+tmp<-data_all
+
+
+tmp$Status <-tmp$Coxreg_update_status 
+
+tmp$Time <- tmp$Coxreg_update_time_conversion
+
+
+
+## Prepare FI for cox regression
+tmp$FI_cox_standard <- tmp$FI_standard * 100
+tmp$FI_cox_refined <- tmp$FI_refined * 100
+
+if (include_Canevelli){
+  tmp$FI_cox_Canevelli <- tmp$FI_Canevelli * 100
+}
+
+
+
+
+convert <- tmp %>% 
+  filter(Dx=="MCI" | Dx=="HC")
+
+
+convert$Dx <-factor(convert$Dx) #drops unused factor level, i.e. AD.. if not, below does  NOT work
+
+MCI_convert <- tmp %>%
+  filter(Dx=="MCI")
+
+```
+
+Total number of data for cox regression (Dx == "MCI") is  `r nrow(MCI_convert)`
+<br>
+Number of missing data for cox regression is: `r sum(is.na(MCI_convert$Coxreg_update_status))`
+
+
+
+
+```{r, echo = FALSE, results='asis', warning=FALSE, message=FALSE}
+
+# remove rows with 0 or negative time
+MCI_convert <- MCI_convert[MCI_convert$Time > 0 , ]
+
+```
+
+After removing missing data, and Time <= 0, the final number of data for cox regression is : `r nrow(MCI_convert)`
+
+
+
+```{r, echo = FALSE, results='asis', warning=FALSE, message=FALSE}
+MCI_FI.cox <- coxph(Surv(Time, Status) ~ FI_cox_standard + Age + Sex, data=MCI_convert)
+  cox=summary(MCI_FI.cox)
+  coef<-as.data.frame(cox$coefficients)
+  conf<-as.data.frame(cox$conf.int);conf$`exp(-coef)`<-NULL;conf$`exp(coef)`<-NULL
+  wald<-as.data.frame(MCI_FI.cox$wald); names(coef)<-c("coef", "exp(coef)", "se(coef)", "z (wald)", "Pr(>|z|)"); names(wald)<-"Wald (whole model)" 
+  coxall<-cbind(coef,conf,wald)
+  z=ztable(coxall, caption="MCI FI") 
+  z
+```
+
+
+```{r, echo = FALSE}
+print("proportional hazards assumption"); cox.zph(MCI_FI.cox)
+```
+
+<br>
+VIF
+```{r, echo = FALSE}
+vif(MCI_FI.cox)
+```
+
+
+<br><br>
+<br><br>
+
+
+```{r, echo = FALSE, results='asis', warning=FALSE, message=FALSE}
+MCI_FI_edu.cox <- coxph(Surv(Time, Status) ~ FI_cox_standard + Age + Sex + PTEDUCAT, data=MCI_convert)
+  cox=summary(MCI_FI_edu.cox)
+  coef<-as.data.frame(cox$coefficients)
+  conf<-as.data.frame(cox$conf.int);conf$`exp(-coef)`<-NULL;conf$`exp(coef)`<-NULL
+  wald<-as.data.frame(MCI_FI_edu.cox$wald); names(coef)<-c("coef", "exp(coef)", "se(coef)", "z (wald)", "Pr(>|z|)"); names(wald)<-"Wald (whole model)" 
+  coxall<-cbind(coef,conf,wald)
+  z=ztable(coxall, caption="MCI FI + PTEDUCAT") 
+  z
+  
+```
+
+
+```{r, echo = FALSE}
+print("proportional hazards assumption"); cox.zph(MCI_FI_edu.cox)
+```
+<br>
+VIF
+```{r, echo = FALSE}
+vif(MCI_FI_edu.cox)
+```
+
+
+
+```{r, echo=FALSE}
+MCI_FI_edu_cox_res <- coxall %>% 
+  dplyr::select(`exp(coef)`, `z (wald)`, `Pr(>|z|)`, `lower .95`, `upper .95`) %>% 
+  filter(row_number()==1)
+```
+
+
+<br><br>
+<br><br>
+
+```{r, echo = FALSE, results='asis', warning=FALSE, message=FALSE}
+MCI_FI_edu_MCI_cluster_refined.cox <- coxph(Surv(Time, Status) ~ FI_cox_refined + Age + Sex + PTEDUCAT, data=MCI_convert)
+  cox=summary(MCI_FI_edu_MCI_cluster_refined.cox)
+  coef<-as.data.frame(cox$coefficients)
+  conf<-as.data.frame(cox$conf.int);conf$`exp(-coef)`<-NULL;conf$`exp(coef)`<-NULL
+  wald<-as.data.frame(MCI_FI_edu_MCI_cluster_refined.cox$wald); names(coef)<-c("coef", "exp(coef)", "se(coef)", "z (wald)", "Pr(>|z|)"); names(wald)<-"Wald (whole model)" 
+  coxall<-cbind(coef,conf,wald)
+  z=ztable(coxall, caption="MCI FI (cluster refined) + PTEDUCAT") 
+  z
+```
+
+
+```{r, echo = FALSE}
+print("proportional hazards assumption"); cox.zph(MCI_FI_edu_MCI_cluster_refined.cox)
+```
+<br>
+VIF
+```{r, echo = FALSE}
+vif(MCI_FI_edu_MCI_cluster_refined.cox)
+```
+
+
+
+```{r, echo=FALSE}
+
+MCI_FI_edu_cox_refined_res <- coxall %>% 
+  dplyr::select(`exp(coef)`, `z (wald)`, `Pr(>|z|)`, `lower .95`, `upper .95`) %>% 
+  filter(row_number()==1)
+
+
+MCI_FI_edu_cox_all_res <- rbind(MCI_FI_edu_cox_res, MCI_FI_edu_cox_refined_res)
+
+
+```
+```{r, echo=FALSE, results="hide", message=FALSE}
+
+if (save_cox_table){
+  MCI_FI_edu_cox_all_flex <- df2flextable(MCI_FI_edu_cox_all_res, 
+                                          add.rownames=TRUE, digits=5)
+  table2docx(MCI_FI_edu_cox_all_flex, title = "Cox regression results: correcting for age, sex, and 
+             education", target=paste0(results_dir, "/", chosen_FI_refined, "/", ADNI_sample, 
+                                       "_cox_reg_education"))
+}
+
+```
+
+```{r, echo = FALSE, results='asis', warning=FALSE, message=FALSE, eval=only_for_ADNI1_Canevelli}
+MCI_FI_edu_MCI_cluster_Canevelli.cox <- coxph(Surv(Time, Status) ~ FI_cox_Canevelli + Age + Sex + PTEDUCAT, data=MCI_convert)
+cox=summary(MCI_FI_edu_MCI_cluster_Canevelli.cox)
+coef<-as.data.frame(cox$coefficients)
+conf<-as.data.frame(cox$conf.int);conf$`exp(-coef)`<-NULL;conf$`exp(coef)`<-NULL
+wald<-as.data.frame(MCI_FI_edu_MCI_cluster_Canevelli.cox$wald); names(coef)<-c("coef", "exp(coef)", "se(coef)", "z (wald)", "Pr(>|z|)"); names(wald)<-"Wald (whole model)" 
+coxall<-cbind(coef,conf,wald)
+z=ztable(coxall, caption="MCI FI (cluster Canevelli) + PTEDUCAT") 
+z
+```
+
+
+```{r, echo = FALSE, eval=only_for_ADNI1_Canevelli}
+print("proportional hazards assumption"); cox.zph(MCI_FI_edu_MCI_cluster_Canevelli.cox)
+```
+<br>
+VIF
+```{r, echo = FALSE, eval=only_for_ADNI1_Canevelli}
+vif(MCI_FI_edu_MCI_cluster_Canevelli.cox)
+```
+
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+MCI_FI_edu_cox_Canevelli_res <- coxall %>% 
+  dplyr::select(`exp(coef)`, `z (wald)`, `Pr(>|z|)`, `lower .95`, `upper .95`) %>% 
+  filter(row_number()==1)
+
+
+MCI_FI_edu_cox_all_res <- rbind(MCI_FI_edu_cox_res, MCI_FI_edu_cox_refined_res, MCI_FI_edu_cox_Canevelli_res)
+
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=include_Canevelli}
+
+if (save_cox_table){
+  MCI_FI_edu_cox_all_flex <- df2flextable(MCI_FI_edu_cox_all_res, 
+                                          add.rownames=TRUE, digits=5)
+  table2docx(MCI_FI_edu_cox_all_flex, title = "Cox regression results: correcting for age, sex, and 
+             education", target=paste0(results_dir, "/", chosen_FI_refined, "/", ADNI_sample, 
+                                       "_cox_reg_education"))
+}
+
+```
+<br><br>
+<br><br>
+
+
+```{r, echo = FALSE, results='asis', warning=FALSE, message=FALSE}
+MCI_FI_CDRSB.cox <- coxph(Surv(Time, Status) ~ FI_cox_standard + Age + Sex + CDRSB, data=MCI_convert)
+  cox=summary(MCI_FI_CDRSB.cox)
+  coef<-as.data.frame(cox$coefficients)
+  conf<-as.data.frame(cox$conf.int);conf$`exp(-coef)`<-NULL;conf$`exp(coef)`<-NULL
+  wald<-as.data.frame(MCI_FI_CDRSB.cox$wald); names(coef)<-c("coef", "exp(coef)", "se(coef)", "z (wald)", "Pr(>|z|)"); names(wald)<-"Wald (whole model)" 
+  coxall<-cbind(coef,conf,wald)
+  z=ztable(coxall, caption="MCI FI + CDRSB") 
+  z
+```
+
+
+```{r, echo = FALSE}
+print("proportional hazards assumption"); cox.zph(MCI_FI_CDRSB.cox)
+```
+
+<br>
+VIF
+```{r, echo = FALSE}
+vif(MCI_FI_CDRSB.cox)
+```
+
+
+
+```{r, echo=FALSE}
+MCI_FI_CDRSB_cox_res <- coxall %>% 
+  dplyr::select(`exp(coef)`, `z (wald)`, `Pr(>|z|)`, `lower .95`, `upper .95`) %>% 
+  filter(row_number()==1)
+```
+
+<br><br>
+<br><br>
+
+
+```{r, echo = FALSE, results='asis', warning=FALSE, message=FALSE}
+MCI_FI_CDRSB_MCI_cluster_refined.cox <- coxph(Surv(Time, Status) ~ FI_cox_refined + Age + Sex + CDRSB, data=MCI_convert)
+  cox=summary(MCI_FI_CDRSB_MCI_cluster_refined.cox)
+  coef<-as.data.frame(cox$coefficients)
+  conf<-as.data.frame(cox$conf.int);conf$`exp(-coef)`<-NULL;conf$`exp(coef)`<-NULL
+  wald<-as.data.frame(MCI_FI_CDRSB_MCI_cluster_refined.cox$wald); names(coef)<-c("coef", "exp(coef)", "se(coef)", "z (wald)", "Pr(>|z|)"); names(wald)<-"Wald (whole model)" 
+  coxall<-cbind(coef,conf,wald)
+  z=ztable(coxall, caption="MCI FI (cluster refined) + CDRSB") 
+  z
+```
+
+
+```{r, echo = FALSE}
+print("proportional hazards assumption"); cox.zph(MCI_FI_CDRSB_MCI_cluster_refined.cox)
+
+```
+<br>
+VIF
+```{r, echo = FALSE}
+vif(MCI_FI_CDRSB_MCI_cluster_refined.cox)
+```
+
+
+<br><br>
+<br><br>
+
+
+
+```{r, echo = FALSE, results='asis', warning=FALSE, message=FALSE}
+MCI_FI_edu_CDRSB.cox <- coxph(Surv(Time, Status) ~ FI_cox_standard + Age + Sex + PTEDUCAT + CDRSB, data=MCI_convert)
+  cox=summary(MCI_FI_edu_CDRSB.cox)
+  coef<-as.data.frame(cox$coefficients)
+  conf<-as.data.frame(cox$conf.int);conf$`exp(-coef)`<-NULL;conf$`exp(coef)`<-NULL
+  wald<-as.data.frame(MCI_FI_edu_CDRSB.cox$wald); names(coef)<-c("coef", "exp(coef)", "se(coef)", "z (wald)", "Pr(>|z|)"); names(wald)<-"Wald (whole model)" 
+  coxall<-cbind(coef,conf,wald)
+  z=ztable(coxall, caption="MCI FI + CDRSB + PTEDUCAT") 
+  z
+```
+
+```{r, echo=FALSE}
+MCI_FI_edu_CDRSB_cox_standard_res <- coxall %>% 
+  dplyr::select(`exp(coef)`, `z (wald)`, `Pr(>|z|)`, `lower .95`, `upper .95`) %>% 
+  filter(row_number()==1)
+```
+
+
+
+```{r, echo = FALSE}
+print("proportional hazards assumption"); cox.zph(MCI_FI_edu_CDRSB.cox)
+```
+<br>
+VIF
+```{r, echo = FALSE}
+vif(MCI_FI_edu_CDRSB.cox)
+```
+
+
+
+```{r, echo = FALSE, results='asis', warning=FALSE, message=FALSE}
+MCI_FI_edu_CDRSB_refined.cox <- coxph(Surv(Time, Status) ~ FI_cox_refined + Age + Sex + PTEDUCAT + CDRSB, data=MCI_convert)
+  cox=summary(MCI_FI_edu_CDRSB_refined.cox)
+  coef<-as.data.frame(cox$coefficients)
+  conf<-as.data.frame(cox$conf.int);conf$`exp(-coef)`<-NULL;conf$`exp(coef)`<-NULL
+  wald<-as.data.frame(MCI_FI_edu_CDRSB_refined.cox$wald); names(coef)<-c("coef", "exp(coef)", "se(coef)", "z (wald)", "Pr(>|z|)"); names(wald)<-"Wald (whole model)" 
+  coxall<-cbind(coef,conf,wald)
+  z=ztable(coxall, caption="MCI FI (cluster refined) + CDRSB + PTEDUCAT") 
+  z
+```
+
+
+```{r, echo = FALSE}
+print("proportional hazards assumption"); cox.zph(MCI_FI_edu_CDRSB_refined.cox)
+```
+<br>
+VIF
+```{r, echo = FALSE}
+vif(MCI_FI_edu_CDRSB_refined.cox)
+```
+
+
+
+```{r, echo=FALSE}
+MCI_FI_edu_CDRSB_cox_refined_res <- coxall %>% 
+  dplyr::select(`exp(coef)`, `z (wald)`, `Pr(>|z|)`, `lower .95`, `upper .95`) %>% 
+  filter(row_number()==1)
+
+
+MCI_FI_edu_CDRSB_cox_all_res <- rbind(MCI_FI_edu_CDRSB_cox_standard_res, MCI_FI_edu_CDRSB_cox_refined_res)
+
+
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE}
+
+if (save_cox_table){
+  MCI_FI_edu_CDRSB_cox_all_flex <- df2flextable(MCI_FI_edu_CDRSB_cox_all_res, 
+                                                add.rownames = TRUE, digits=5)
+  table2docx(MCI_FI_edu_CDRSB_cox_all_flex, title = "Cox regression results: correcting for age, sex, 
+             education and CDRSB", target=paste0(results_dir, "/", chosen_FI_refined, "/", ADNI_sample, 
+                                       "_cox_reg_edu_CDRS"))
+}
+
+```
+
+```{r, echo = FALSE, results='asis', warning=FALSE, message=FALSE}
+MCI_FI_edu_CDRSB_Canevelli.cox <- coxph(Surv(Time, Status) ~ FI_cox_Canevelli + Age + Sex + PTEDUCAT + CDRSB, data=MCI_convert)
+cox=summary(MCI_FI_edu_CDRSB_Canevelli.cox)
+coef<-as.data.frame(cox$coefficients)
+conf<-as.data.frame(cox$conf.int);conf$`exp(-coef)`<-NULL;conf$`exp(coef)`<-NULL
+wald<-as.data.frame(MCI_FI_edu_CDRSB_Canevelli.cox$wald); names(coef)<-c("coef", "exp(coef)", "se(coef)", "z (wald)", "Pr(>|z|)"); names(wald)<-"Wald (whole model)" 
+coxall<-cbind(coef,conf,wald)
+z=ztable(coxall, caption="MCI FI (cluster Canevelli) + CDRSB + PTEDUCAT") 
+z
+```
+
+
+```{r, echo = FALSE}
+print("proportional hazards assumption"); cox.zph(MCI_FI_edu_CDRSB_Canevelli.cox)
+```
+<br>
+  VIF
+```{r, echo = FALSE}
+vif(MCI_FI_edu_CDRSB_Canevelli.cox)
+```
+
+
+```{r, echo=FALSE}
+
+MCI_FI_edu_CDRSB_cox_Canevelli_res <- coxall %>% 
+  dplyr::select(`exp(coef)`, `z (wald)`, `Pr(>|z|)`, `lower .95`, `upper .95`) %>% 
+  filter(row_number()==1)
+
+
+MCI_FI_edu_CDRSB_cox_all_res <- rbind(MCI_FI_edu_CDRSB_cox_standard_res, MCI_FI_edu_CDRSB_cox_refined_res, 
+                                      MCI_FI_edu_CDRSB_cox_Canevelli_res)
+
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE}
+
+
+
+if (save_cox_table){
+  MCI_FI_edu_CDRSB_cox_all_flex <- df2flextable(MCI_FI_edu_CDRSB_cox_all_res, 
+                                                add.rownames = TRUE, digits=5)
+  table2docx(MCI_FI_edu_CDRSB_cox_all_flex, title = "Cox regression results: correcting for age, sex, 
+             education and CDRSB", target=paste0(results_dir, "/", chosen_FI_refined, "/", ADNI_sample, 
+                                                 "_cox_reg_edu_CDRS"))
+}
+
+```
+
+<br><br>
+<br><br>
+
+
+
+### Weighted cox regression
+
+
+
+
+Weighted cox regression (MCI -> AD): FI standard corrected for Age, Sex and Education
+
+```{r, echo = FALSE,warning=FALSE, message=FALSE}
+MCI_FI_edu.cox_weighted <- coxphw(Surv(Time, Status) ~ FI_cox_standard + Age + Sex + PTEDUCAT, template="AHR", data=MCI_convert)
+cox_weighted=summary(MCI_FI_edu.cox_weighted)
+cox_weighted
+```
+
+
+
+<br><br>
+<br><br>
+
+Weighted cox regression (MCI -> AD): FI refined corrected for Age, Sex and Education
+
+```{r, echo = FALSE,warning=FALSE, message=FALSE}
+MCI_FI_edu_refined.cox_weighted <- coxphw(Surv(Time, Status) ~ FI_cox_refined + Age + Sex + PTEDUCAT, template="AHR", data=MCI_convert)
+cox_weighted=summary(MCI_FI_edu_refined.cox_weighted)
+cox_weighted
+```
+
+<br><br>
+<br><br>
+
+Weighted cox regression (MCI -> AD): FI standard corrected for Age, Sex,  Education and CDRSB
+
+```{r, echo = FALSE,warning=FALSE, message=FALSE}
+MCI_FI_edu_CDRSB.cox_weighted <- coxphw(Surv(Time, Status) ~ FI_cox_standard + Age + Sex + PTEDUCAT + CDRSB, template="AHR", data=MCI_convert)
+cox_weighted=summary(MCI_FI_edu_CDRSB.cox_weighted)
+cox_weighted
+```
+
+
+
+<br><br>
+<br><br>
+
+Weighted cox regression (MCI -> AD): FI refined corrected for Age, Sex,  Education and CDRSB
+
+```{r, echo = FALSE,warning=FALSE, message=FALSE}
+MCI_FI_edu_CDRSB_refined.cox_weighted <- coxphw(Surv(Time, Status) ~ FI_cox_refined + Age + Sex + PTEDUCAT + CDRSB, template="AHR", 
+                                                            data=MCI_convert)
+
+cox_weighted=summary(MCI_FI_edu_CDRSB_refined.cox_weighted)
+cox_weighted
+```
+
+
+<br><br>
+<br><br>
+  
+
+
+```{r, echo = FALSE,warning=FALSE, message=FALSE, eval=include_Canevelli}
+print("Weighted cox regression (MCI -> AD): FI Canevelli corrected for Age, Sex,  Education and CDRSB")
+print("\n")
+print("\n")
+
+MCI_FI_edu_CDRSB_Canevelli.cox_weighted <- coxphw(Surv(Time, Status) ~ FI_cox_Canevelli + Age + Sex + PTEDUCAT + CDRSB, template="AHR", 
+                                                data=MCI_convert)
+
+cox_weighted=summary(MCI_FI_edu_CDRSB_Canevelli.cox_weighted)
+cox_weighted
+```
+
+## Kaplan-meier plots (univariate)
+
+
+Kaplan-Meier plots based on univariate cox regression models
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+
+
+MCI_FI_standard_raw.cox <- coxph(Surv(Time, Status) ~ FI_cox_standard, data=MCI_convert)
+
+summary(MCI_FI_standard_raw.cox)
+
+MCI_FI_standard_ggsurv <-ggsurvplot(survfit(MCI_FI_standard_raw.cox), data = MCI_convert,
+                                    conf.int = FALSE,
+                                    palette = "red",
+                                    legend.title ="",
+                                    legend.labs = "FI standard")
+
+MCI_FI_standard_ggsurv <- annotate_ggsurv(MCI_FI_standard_raw.cox, MCI_FI_standard_ggsurv, 
+                                          main_var="FI_cox_standard", round_digits=3,
+                                          text_size = 3)
+
+
+MCI_FI_refined_raw.cox <- coxph(Surv(Time, Status) ~ FI_cox_refined, data=MCI_convert)
+summary(MCI_FI_refined_raw.cox) 
+
+
+MCI_FI_refined_ggsurv <-ggsurvplot(survfit(MCI_FI_refined_raw.cox), data = MCI_convert,
+                                   conf.int = FALSE,
+                                   palette = "blue", 
+                                   legend.title ="",
+                                   legend.labs = "FI refined",
+                                   risk.table = TRUE,
+                                   tables.y.text=FALSE)
+
+#if want to modify risk table later
+risk_table <- MCI_FI_refined_ggsurv$table +
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+
+
+MCI_FI_refined_ggsurv <- annotate_ggsurv(MCI_FI_refined_raw.cox, MCI_FI_refined_ggsurv, 
+                                         main_var="FI_cox_refined", round_digits=3,
+                                         text_size = 3)
+
+(MCI_FI_standard_ggsurv$plot | MCI_FI_refined_ggsurv$plot) / risk_table +
+  plot_layout(heights = c(4, 1))
+  
+
+```
+
+
+
+```{r kaplan_qaurtile, echo = FALSE, warning=FALSE, message=FALSE, fig.width=9, fig.height=6}
+
+
+MCI_convert$FI_standard_quartile <- dplyr::ntile(MCI_convert$FI_cox_standard, 4)
+MCI_convert$FI_refined_quartile <- dplyr::ntile(MCI_convert$FI_cox_refined, 4)
+
+
+
+MCI_FI_standard_quant.km.fit<-survfit(Surv(Time, Status) ~ FI_standard_quartile, data=MCI_convert)
+MCI_FI_standard_quant.km.surv<-ggsurvplot(MCI_FI_standard_quant.km.fit,risk.table = TRUE,
+                                    tables.y.text=TRUE, 
+                                    legend.labs=c("Q1", "Q2", "Q3", "Q4"), 
+                                    conf.int = FALSE,
+                                    xlab="Time")
+
+MCI_FI_standard_quant.cox <- coxph(Surv(Time, Status) ~ FI_standard_quartile, data=MCI_convert)
+cox=summary(MCI_FI_standard_quant.cox)
+
+
+MCI_FI_standard_quant_df <- with(MCI_convert,
+                           data.frame(FI_standard_quartile=c(1,2,3,4)
+                                      )
+                           ) 
+
+
+
+
+MCI_FI_standard_quant.fit <- survfit(MCI_FI_standard_quant.cox, newdata = MCI_FI_standard_quant_df)
+
+MCI_FI_standard_quant_surv<-ggsurvplot(MCI_FI_standard_quant.fit, 
+                                        conf.int = FALSE,
+                                        data=MCI_convert, 
+                                        legend.labs=c("Q1", "Q2", "Q3", "Q4"),
+                                        surv.median.line = "hv",
+                                        xlab="", 
+                                        ylab="1 - Conversion Probability")
+
+MCI_FI_standard_raw.cox <- coxph(Surv(Time, Status) ~ FI_cox_standard, data=MCI_convert)
+MCI_FI_standard_quant_surv <-annotate_ggsurv(MCI_FI_standard_raw.cox, 
+                                              MCI_FI_standard_quant_surv, 
+                                              main_var="FI_cox_standard", 
+                                              round_digits=3,text_size = 3)
+
+
+MCI_FI_standard_quant_surv$table <- MCI_FI_standard_quant.km.surv$table
+
+
+
+########## REFINED##########
+MCI_FI_refined_quant.km.fit<-survfit(Surv(Time, Status) ~ FI_refined_quartile, data=MCI_convert)
+MCI_FI_refined_quant.km.surv<-ggsurvplot(MCI_FI_refined_quant.km.fit,risk.table = TRUE,
+                                         tables.y.text=TRUE, 
+                                         legend.labs=c("Q1", "Q2", "Q3", "Q4"), 
+                                         conf.int = FALSE,
+                                         xlab="Time",
+                                         palette="Dark2") 
+
+
+MCI_FI_refined_quant.cox <- coxph(Surv(Time, Status) ~ FI_refined_quartile, data=MCI_convert)
+cox=summary(MCI_FI_refined_quant.cox)
+
+
+MCI_FI_refined_quant_df <- with(MCI_convert,
+                                data.frame(FI_refined_quartile=c(1,2,3,4)
+                                )
+) 
+
+
+
+
+MCI_FI_refined_quant.fit <- survfit(MCI_FI_refined_quant.cox, newdata = MCI_FI_refined_quant_df)
+MCI_FI_refined_quant_surv<-ggsurvplot(MCI_FI_refined_quant.fit, 
+                                       conf.int = FALSE,
+                                       data=MCI_convert, 
+                                       legend.labs=c("Q1", "Q2", "Q3", "Q4"),
+                                       surv.median.line = "hv",
+                                       xlab="", 
+                                       ylab="1 - Conversion Probability",
+                                      palette="Dark2")
+
+# JUST for labeling
+MCI_FI_refined_raw.cox <- coxph(Surv(Time, Status) ~ FI_cox_refined, data=MCI_convert)
+MCI_FI_refined_quant_surv <-annotate_ggsurv(MCI_FI_refined_raw.cox, 
+                                            MCI_FI_refined_quant_surv, 
+                                            main_var="FI_cox_refined", 
+                                            round_digits=3,text_size = 3)
+
+
+MCI_FI_refined_quant_surv$table <- MCI_FI_refined_quant.km.surv$table
+
+
+MCI_FI_standard_quant_surv$plot<-
+MCI_FI_standard_quant_surv$plot +
+  labs(title="FI standard",
+       tag="A")
+
+MCI_FI_refined_quant_surv$plot<-
+MCI_FI_refined_quant_surv$plot +
+  labs(title="FI refined",
+       tag="B") 
+
+(MCI_FI_standard_quant_surv$plot | MCI_FI_refined_quant_surv$plot) /
+  (MCI_FI_standard_quant_surv$table | MCI_FI_refined_quant_surv$table)+
+  plot_layout(heights = c(4, 1))
+
+
+  
+
+```
+
+
+```{r kaplan_canevelli, echo = FALSE, warning=FALSE, message=FALSE, fig.width=5, fig.height=6}
+
+MCI_convert$FI_Canevelli_quartile <- dplyr::ntile(MCI_convert$FI_cox_Canevelli, 4)
+MCI_convert$FI_refined_quartile <- dplyr::ntile(MCI_convert$FI_cox_refined, 4)
+
+
+
+MCI_FI_Canevelli_quant.km.fit<-survfit(Surv(Time, Status) ~ FI_Canevelli_quartile, data=MCI_convert)
+MCI_FI_Canevelli_quant.km.surv<-ggsurvplot(MCI_FI_Canevelli_quant.km.fit,risk.table = TRUE,
+                                          tables.y.text=TRUE, 
+                                          legend.labs=c("Q1", "Q2", "Q3", "Q4"), 
+                                          conf.int = FALSE,
+                                          palette = "Set1") 
+
+
+MCI_FI_Canevelli_quant.cox <- coxph(Surv(Time, Status) ~ FI_Canevelli_quartile, data=MCI_convert)
+cox=summary(MCI_FI_Canevelli_quant.cox)
+
+
+MCI_FI_Canevelli_quant_df <- with(MCI_convert,
+                                 data.frame(FI_Canevelli_quartile=c(1,2,3,4)
+                                 )
+) 
+
+
+
+
+MCI_FI_Canevelli_quant.fit <- survfit(MCI_FI_Canevelli_quant.cox, newdata = MCI_FI_Canevelli_quant_df)
+
+MCI_FI_Canevelli_quant_surv<-ggsurvplot(MCI_FI_Canevelli_quant.fit, 
+                                       conf.int = FALSE,
+                                       data=MCI_convert, 
+                                       legend.labs=c("Q1", "Q2", "Q3", "Q4"),
+                                       surv.median.line = "hv", 
+                                       xlab="", 
+                                       ylab="1 - Conversion Probability",
+                                       palette = "Set1")
+
+MCI_FI_Canevelli_raw.cox <- coxph(Surv(Time, Status) ~ FI_cox_Canevelli, data=MCI_convert)
+MCI_FI_Canevelli_quant_surv <-annotate_ggsurv(MCI_FI_Canevelli_raw.cox, 
+                                             MCI_FI_Canevelli_quant_surv, 
+                                             main_var="FI_cox_Canevelli", 
+                                             round_digits=3,text_size = 4)
+
+
+MCI_FI_Canevelli_quant_surv$table <- MCI_FI_Canevelli_quant.km.surv$table
+
+
+
+MCI_FI_Canevelli_quant_surv$plot / MCI_FI_Canevelli_quant_surv$table+
+  plot_layout(heights = c(4, 1))
+              
+              
+
+```
+
+
+## Compare cox-reg models (MCI)
+
+Standard FI
+
+```{r, echo=FALSE}
+ROC_FI_standard<-timeROC(T=MCI_convert$Time,
+        delta=MCI_convert$Status, marker=MCI_convert$FI_cox_standard,
+        cause=1, weighting="marginal",
+        times=c(365, 730, 1460), #days
+        iid=TRUE)
+
+ROC_FI_standard
+```
+
+
+Standard FI
+
+```{r, echo=FALSE}
+plotAUCcurve(ROC_FI_standard, conf.int = TRUE, conf.band = TRUE)
+```
+
+<br>
+<br>
+Refined FI
+
+```{r, echo=FALSE}
+ROC_FI_refined<-timeROC(T=MCI_convert$Time,
+                    delta=MCI_convert$Status, marker=MCI_convert$FI_cox_refined,
+                    cause=1, weighting="marginal",
+                    times=c(365, 730, 1460), #days
+                    iid=TRUE)
+
+ROC_FI_refined
+```
+
+
+Refined FI
+
+```{r, echo=FALSE}
+plotAUCcurve(ROC_FI_refined, conf.int = TRUE, conf.band = TRUE)
+
+```
+
+Comparison (standard FI is first input, refined FI is second input)
+```{r, echo=FALSE}
+timeROC::compare(ROC_FI_standard,ROC_FI_refined,adjusted=TRUE)
+```
+
+
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE, fig.width=9, fig.height=6}
+(MCI_FI_standard_quant_surv$plot | MCI_FI_refined_quant_surv$plot) /
+  (MCI_FI_standard_quant_surv$table | MCI_FI_refined_quant_surv$table)+
+  plot_layout(heights = c(4, 1))#+ 
+```
+
+```{r, echo=FALSE}
+plotAUCcurve(ROC_FI_standard, conf.int = FALSE, conf.band = FALSE, col="blue")
+plotAUCcurve(ROC_FI_refined, conf.int = FALSE, conf.band = FALSE, col="red", add=TRUE)
+legend("topright",c("FI standard","FI refined"),col=c("blue","red"),lty=1,lwd=2)
+
+```
+
+Canevelli FI
+
+```{r, echo=FALSE}
+ROC_FI_Canevelli<-timeROC(T=MCI_convert$Time,
+        delta=MCI_convert$Status, marker=MCI_convert$FI_cox_Canevelli,
+        cause=1, weighting="marginal",
+        times=c(365, 730, 1460), #days
+        iid=TRUE)
+
+ROC_FI_Canevelli
+```
+
+
+Canevelli FI
+
+```{r, echo=FALSE}
+plotAUCcurve(ROC_FI_Canevelli, conf.int = TRUE, conf.band = TRUE)
+```
+
+
+Comparison (Canevelli FI is first input, refined FI is second input)
+
+```{r, echo=FALSE}
+timeROC::compare(ROC_FI_Canevelli,ROC_FI_refined,adjusted=TRUE)
+```
+
+```{r}
+plotAUCcurve(ROC_FI_standard, conf.int = FALSE, conf.band = FALSE, col="blue")
+plotAUCcurve(ROC_FI_refined, conf.int = FALSE, conf.band = FALSE, col="red", add=TRUE)
+plotAUCcurve(ROC_FI_Canevelli, conf.int = FALSE, conf.band = FALSE, col="green", add=TRUE)
+legend("topright",c("FI standard","FI refined", "FI Canevelli"),col=c("blue","red","green"),lty=1,lwd=2)
+```
+
+
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("# Clustering similarity analyses\\n")
+
+print("Comparing clustering similarity using different number of FAMD components,\n")
+print("based on different percentage variance explained, comparing chosen threshold\n")
+print(paste0(FAMD_threshold, "% with 20%, 40%, 60%, and all components"))
+```
+
+
+
+
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+k_20 <- min(which(eig.val$cumulative.variance.percent > 20))
+k_40 <- min(which(eig.val$cumulative.variance.percent > 40))
+k_60 <- min(which(eig.val$cumulative.variance.percent > 60))
+
+
+FAMD_20 <- FAMD(input_clustering, graph = FALSE, ncp = k_20) 
+FAMD_40 <- FAMD(input_clustering, graph = FALSE, ncp = k_40) 
+FAMD_60 <- FAMD(input_clustering, graph = FALSE, ncp = k_60) 
+
+hcpc_20 <- HCPC(FAMD_20, nb.clust = kclust, graph = FALSE, min = kmin,
+                  metric=cluster_metric, method=cluster_method)
+
+hcpc_40 <- HCPC(FAMD_40, nb.clust = kclust, graph = FALSE, min = kmin,
+                  metric=cluster_metric, method=cluster_method)
+
+hcpc_60 <- HCPC(FAMD_60, nb.clust = kclust, graph = FALSE, min = kmin,
+                  metric=cluster_metric, method=cluster_method)
+
+hcpc_all <- HCPC(FAMD_all, nb.clust = kclust, graph = FALSE, min = kmin,
+                  metric=cluster_metric, method=cluster_method)
+```
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print(paste0("The number of components for 20% variance is: ", k_20))
+
+print(paste0("The number of components for 40% variance is: ", k_40))
+
+print(paste0("The number of components for 60% variance is: ", k_60))
+```
+
+
+<br>
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("## Jaccard index\\n")
+```
+
+
+`r if(only_for_ADNI1){
+  "Values range from 0 to 1, where the higher the number, the more similar
+  <br>
+  the clustering results"
+}`
+
+
+
+
+<br>
+<br>
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Compared to 20% variance\n")
+compare.jaccard(res.hcpc$data.clust$clust, hcpc_20$data.clust$clust)
+```
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Compared to 40% variance\n")
+compare.jaccard(res.hcpc$data.clust$clust, hcpc_40$data.clust$clust)
+```
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Compared to 60% variance\n")
+compare.jaccard(res.hcpc$data.clust$clust, hcpc_60$data.clust$clust)
+```
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Compared to all components used in clustering\n")
+compare.jaccard(res.hcpc$data.clust$clust, hcpc_all$data.clust$clust)
+```

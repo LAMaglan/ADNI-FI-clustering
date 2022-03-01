@@ -1,0 +1,1561 @@
+---
+title: "Frailty index and the brain: analyses using `r prep_title`"
+output: 
+    html_document: 
+      toc: true
+      theme: united
+---
+
+To compute frailty index (FI) and check for association between this general health metric and other variable of interests. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = F, warning = F)
+
+
+library("dplyr")
+library("car")
+library("ggplot2")
+library("reshape2")
+library("ADNIMERGE")
+library("lubridate")
+library("stringr")
+
+my_theme <- theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+The rest of the script applies for sample: `r ADNI_sample`
+
+```{r define_functions, echo = F}
+load_subject_weights <- function (f_path)
+{
+    d <- read.table(f_path, skip = 6, header = F, sep = "")
+    col_names <- paste0("IC", 0:(dim(d)[2] -1))
+    names(d) <- col_names
+    d
+}
+
+pairwise_group_compare <- function (y, age, sex, dx)
+{
+    sex <- as.factor(sex)
+    dx <- as.factor(dx)
+    mod <- lm(y ~ poly(age,2) + sex + dx)
+    con <- cld(lsmeans(mod,pairwise ~ dx,adjust = "BON")$contrast,sort=FALSE)
+    res <- data.frame(pair=con$contrast,t=con$t.ratio,df=con$df, p=con$p.value)
+    res <- res %>% mutate(cohenD=computeCohenD(t,df)) 
+}
+
+computeCohenD <- function (t,df)
+{
+  cohen.d <- 2*t / (sqrt(df))
+}
+
+performANOVA <- function (age,sex,dx,ic)
+{
+    ssType <- 2
+    
+    mod <- lm(ic ~ age + as.factor(sex) + as.factor(dx))
+    fVec <- as.matrix(Anova(mod,type=ssType)["F value"])
+    pVec <- as.matrix(Anova(mod,type=ssType)["Pr(>F)"])
+    dfVec <- as.matrix(Anova(mod,type=ssType)["Df"])
+    sqVec <- as.matrix(Anova(mod,type=ssType)["Sum Sq"])
+    
+    # compute percent explained variance
+    sqVec <- sqVec*100 / sum(sqVec)
+    
+    return(list(f=fVec,p=pVec,df=dfVec,sq=sqVec))
+}
+
+perform_ANOVA <- function (ic,age,sex,dx)
+{
+    require(broom)
+    ssType <- 2
+    sex <- as.factor(sex)
+    dx <- as.factor(dx)
+    mod <- lm(ic ~ poly(age,2) + sex + dx)
+    res <- tidy(Anova(mod,type=ssType))
+}
+
+
+remove_duplicates_using_examdate <- function (din)
+{
+    #expect a dataframe with at least two columns: RID, EXAMDATE
+    duplicated_IDs <- din[which(duplicated(din[,"RID"])), "RID"]  
+    
+    # identify row indices corresponding to the more recent dates among the duplicates
+    idx_2_exclude <- c()
+    for (id in duplicated_IDs)
+    {
+        selected_date <- din %>% filter(RID %in% id) %>%
+          arrange(desc(as.Date(EXAMDATE))) %>% 
+          slice(1) %>% 
+          dplyr::select(EXAMDATE)
+        
+        idx_2_exclude <-c(idx_2_exclude, 
+                          which((din[,"RID"] == id) & (!din[,"EXAMDATE"]==selected_date$EXAMDATE)))
+    }
+        
+    # now remove the identified rows
+    if (length(idx_2_exclude)>0) {din <- din[-idx_2_exclude,]}
+    din
+}
+
+
+format_tidy_var_tab <- function (dorig, varsOI, examdate_suffix,
+                                 sample_size)
+{
+
+    if (ADNI_sample %in% c("ADNI1", "ADNI2", "ADNIGO")){
+      d_bl <- dorig %>% 
+        filter(ORIGPROT == ADNI_sample & (VISCODE %in% c("bl")))
+      d_sc <- dorig %>% 
+        filter(ORIGPROT == ADNI_sample & (VISCODE %in% c("sc")))
+    } else if (ADNI_sample == "ADNI2 & ADNIGO"){
+      d_bl <- dorig %>% 
+        filter(ORIGPROT != "ADNI1" & (VISCODE %in% c("bl")))
+      d_sc <- dorig %>% 
+        filter(ORIGPROT != "ADNI1" & (VISCODE %in% c("sc")))
+    }
+    
+  
+    if (exists("d_bl")){
+      #if ((nrow(d_bl)<819)) #this number is specific to ADNI1
+      if ((nrow(d_bl)<sample_size))
+      {
+          if (nrow(d_bl) > nrow(d_sc))
+          {
+                d <- d_bl
+          } else {
+                d <- d_sc
+          }
+        
+      } else
+      {
+          d <- d_bl
+      }
+    } else {
+      #"bl" (d_bl) not available for ADNI2/ADNIGO
+      d <- d_sc
+    }
+    
+    
+    
+    # VSHEIGHT was only collected at screening, thus need to use data at screening instead of baseline
+    if ("VSHEIGHT" %in% varsOI) {d <- d_sc} 
+    
+    d <- remove_duplicates_using_examdate(d)
+    
+    new_date_name <- paste("EXAMDATE", examdate_suffix, sep = "_")
+    
+    if (!length(which(names(hcres) %in% c("EXAMDATE")))==0)
+    {
+      names(d)[which(names(d) %in% c("EXAMDATE"))] <-  new_date_name #this is important variable
+      d[, c("RID", varsOI,  new_date_name)]
+    } else {
+      d[, c("RID", varsOI)]
+    }
+}
+
+
+
+add_variables_to_main_df <- function (d_main, d_2add)
+{
+  # drop the EXAMDATE_* column if exist in the main data frame
+  # browser()
+  if (names(d_main) %in% names(d_2add)[grep("EXAMDATE",names(d_2add))])
+  {
+      d_2add <- d_2add[, -names(d_2add)[grep("EXAMDATE",names(d_2add))]]
+  }
+  
+  # join them
+  d <- left_join(d_main, d_2add, by = "RID")
+}
+
+
+extract_relevant_data <- function(d, vars_mapping, sample_size){
+  
+  # run format_tidy_var_tab and add_variables_to_main_df for all tables
+  
+  for (tab in unique(vars_mapping[,"table"]))
+  {
+      if(!is.na(tab))
+      {
+            #print(paste0("working with table ", tab))
+  
+            vars_sub <- filter(vars_mapping, table %in% tab)
+  
+  
+            d_2add <- format_tidy_var_tab(d = get(tab), varsOI = vars_sub[,"old_name"],
+                                          examdate_suffix = tab,
+                                          sample_size=d_demo_size)
+  
+  
+            d <- add_variables_to_main_df(d, d_2add)
+            #cat(sprintf("%s - %d", tab, nrow(d)))
+            for (n in 1:nrow(vars_sub))
+            {
+                d <- my_rename(d, vars_sub[,"old_name"], vars_sub[,"new_name"])
+            }
+      }
+  }
+  return(d)
+}
+
+
+perform_GLM_risk_factors <- function (y, age, sex, risk, dx)
+{
+    require(broom)
+    if (length(unique(dx))==1)
+    {
+        mod <- lm(y ~ poly(age,2) + sex + risk)
+    } else {
+        dx <- as.factor(dx)
+        mod <- lm(y ~ poly(age,2) + sex + risk + dx)
+    }
+    
+    res <- tidy(mod)
+    overview <- glance(mod)
+    return(list(res = res, overview = overview))
+}
+compute_CohenD <- function (t,df)
+{
+  cohen.d <- 2*t / (sqrt(df))
+}
+
+my_rename <- function (d, old_name, new_name)
+{
+    names(d)[names(d) %in% old_name] <- new_name
+    d
+}
+
+my_theme <- theme_bw() +
+  theme(axis.title=element_text(size=24),
+        plot.title=element_text(size=36),
+        axis.text =element_text(size=16),
+        axis.text.x = element_text(angle = 45))
+
+remove_weird_character_values <- function(feat)
+{
+    patterns <- c("SCC", "ADC", "RCC", "N/A") #need to check what those string values code for
+    # browser()
+    feat[grep(paste(paste0("^",patterns), collapse = "|"), feat)] <- NA
+    feat
+}
+
+
+convert_threshold_value_2_binary <- function(feat, mapping)
+{
+    
+    # browser()
+    if (is.na(mapping$lower_threshold) & is.na(mapping$upper_threshold))
+    {
+          feat_out <- ifelse(as.character(feat)==as.character(mapping$X0), 0, 1)
+    } else {
+          feat <- as.numeric(feat)
+
+          if (is.na(mapping$lower_threshold))
+          {
+              feat_out <- ifelse(feat >= mapping$upper_threshold, 1, 0)
+          } else if (is.na(mapping$upper_threshold)) {
+              feat_out <- ifelse(feat < mapping$lower_threshold, 1, 0)
+          } else {
+              feat_out <- ifelse((feat < mapping$lower_threshold) | (feat >= mapping$upper_threshold), 1, 0)
+          }
+    }
+    feat_out
+}
+
+
+plotMatrix <- function (d,midPoint,xlab,ylab,title,lab=NULL,text_fontsize=21)
+{
+	require(ggplot2)
+	require(reshape2)
+
+	d4plot <- melt(as.matrix(d))
+
+	d4plot$lab <- sprintf("%.2f",d4plot$value)
+
+	if (!is.null(lab))
+	{
+	    d4plot.lab <- melt(as.matrix(lab))
+	    d4plot$lab <- paste0(d4plot$lab, d4plot.lab$value, sep="")
+	}
+
+	limVec <- c(min(d4plot$value),max(d4plot$value))
+	if (length(midPoint)==0)
+	{
+	    midPoint <- (limVec[2] + limVec[1]) / 2
+	}
+
+	plot <- ggplot(d4plot)
+	plot +  geom_tile(aes(x=Var1, y=Var2, fill=value,labels=sprintf("%.2f",value))) + 
+        	xlab(xlab) + 
+	        ylab(ylab) + 
+        	labs(fill="",title=title)+ 
+	        scale_fill_gradient2(low="blue", mid="white",high="red",limits=limVec,midpoint = midPoint) + 
+        	theme(text = element_text(size=text_fontsize)) + 
+	        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+}
+```
+
+
+```{r load_data, echo = FALSE, warning = FALSE}
+
+# load main dataset, and exclude ADNI3 (RID > 6000)
+d_demo <- ADNIMERGE::adnimerge %>% 
+  dplyr::filter(RID < 6000) %>% 
+  dplyr:: filter(ORIGPROT != "ADNI3")
+
+
+if (ADNI_sample %in% c("ADNI1", "ADNI2", "ADNIGO")){
+  d_demo <- d_demo %>%
+    filter(ORIGPROT == ADNI_sample & VISCODE=="bl") %>%
+    mutate(MRID = paste0(ADNI_sample, "_b_", PTID)) %>%
+    rename(Age = AGE, Sex = PTGENDER)
+} else if (ADNI_sample == "ADNI2 & ADNIGO"){
+  d_demo <- d_demo %>%
+    filter(ORIGPROT != "ADNI1" & VISCODE=="bl") %>%
+    mutate(MRID = paste0("ADNI2_ADNIGO_b_", PTID)) %>%
+    rename(Age = AGE, Sex = PTGENDER)
+}
+
+
+d_demo_size = nrow(d_demo)
+
+if (ADNI_sample=="ADNI2 & ADNIGO"){
+  
+  tmp <- d_demo %>% 
+    filter(ORIGPROT == "ADNI2")
+  ADNI2_size = nrow(tmp)
+  
+  tmp <- d_demo %>% 
+    filter(ORIGPROT == "ADNIGO")
+  
+  ADNIGO_size = nrow(tmp)
+  
+  rm(tmp)
+}
+
+
+
+d_demo$Dx <- NA
+d_demo$Dx[d_demo$DX == "Dementia"] <- "AD"
+d_demo$Dx[d_demo$DX == "CN"] <- "HC"
+d_demo$Dx[d_demo$DX == "MCI"] <- "MCI"
+
+
+d_demo$DX <- factor(d_demo$DX)
+d_demo$Dx <- factor(d_demo$Dx)
+
+if (ADNI_sample!="ADNI1"){
+  
+
+  d_demo$DX.bl <- as.character(d_demo$DX.bl)
+  d_demo$DX.bl[d_demo$DX.bl == "AD"] <- "AD"
+  d_demo$DX.bl[d_demo$DX.bl == "CN"] <- "HC"
+  d_demo$DX.bl[d_demo$DX.bl == "LMCI"] <- "MCI"
+  d_demo$DX.bl[d_demo$DX.bl == "EMCI"] <- "MCI"
+  
+  #Remove rows with "SMC"
+  d_demo <-d_demo[!(d_demo$DX.bl == "SMC"), ] 
+  
+  d_demo <- d_demo %>% 
+    mutate(Dx = coalesce(Dx, DX.bl))
+}
+
+
+
+
+
+# merge variables of interest into main data frame
+vars_mapping <- read.table(paste0(wd, "/list_variables_final.csv"), 
+                           header = T, sep = ",", na.strings = "") 
+
+vars_mapping$old_name <- as.character(vars_mapping$old_name)
+vars_mapping$new_name <- as.character(vars_mapping$new_name)
+vars_mapping$table <- as.character(vars_mapping$table)
+
+
+# ADNI1 adn ADNIGO uses "npi", but ADNI2 uses "npiq"
+if (ADNI_sample=="ADNI2"){
+  vars_mapping$table[vars_mapping$table=="npiq"] <- "npi"
+  vars_mapping$old_name[vars_mapping$old_name=="NPISCORE"] <- "NPITOTAL" 
+} else if (ADNI_sample=="ADNI2 & ADNIGO"){
+  vars_mapping_ADNI2 <- vars_mapping
+  
+  vars_mapping_ADNI2$table[vars_mapping_ADNI2$table=="npiq"] <- "npi"
+  vars_mapping_ADNI2$old_name[vars_mapping_ADNI2$old_name=="NPISCORE"] <- "NPITOTAL" 
+}
+
+
+d <- d_demo
+
+d$RID <- as.integer(d$RID)
+
+if (ADNI_sample %in% c("ADNI1", "ADNI2", "ADNIGO")){
+  d <- extract_relevant_data(d=d, vars_mapping=vars_mapping, sample_size=d_demo_size)
+} else if (ADNI_sample=="ADNI2 & ADNIGO"){
+  
+  d_ADNI2_tmp <- d %>% 
+    filter(ORIGPROT=="ADNI2")
+  
+  d_ADNI2_tmp <- extract_relevant_data(d=d_ADNI2_tmp, 
+                                       vars_mapping=vars_mapping_ADNI2, 
+                                       sample_size=ADNI2_size)
+  
+  d_ADNIGO_tmp <- d %>% 
+    filter(ORIGPROT=="ADNIGO")
+  
+  d_ADNIGO_tmp <- extract_relevant_data(d=d_ADNIGO_tmp, vars_mapping=vars_mapping, 
+                                        sample_size=ADNIGO_size)
+  
+  d <- rbind(d_ADNI2_tmp, d_ADNIGO_tmp)
+  
+  rm(d_ADNI2_tmp)
+  rm(d_ADNIGO_tmp)
+  
+  
+}
+
+
+
+# Add BMI, Lab_Pulse_pressure
+d <- add_variables_to_main_df(d, format_tidy_var_tab(vitals, c("VSWEIGHT", "VSHTUNIT","VSHEIGHT", "VSBPSYS", "VSBPDIA","VSWTUNIT"), examdate_suffix = "vitals", sample_size = d_demo_size)) %>%
+  mutate(height_m = ifelse(VSHTUNIT=="centimeters", VSHEIGHT, 2.54*VSHEIGHT) / 100) %>%
+  mutate(weight_kg = ifelse(VSWTUNIT=="kilograms", VSWEIGHT, 0.453592*VSWEIGHT)) %>% 
+  mutate(Lab_BMI = weight_kg / (height_m^2)) %>% 
+  mutate(Lab_Pulse_pressure = VSBPSYS - VSBPDIA) %>% 
+  mutate(Lab_MAP = VSBPDIA + 1/3 * (VSBPSYS - VSBPDIA))
+
+
+# add additional variables from the reccmeds table
+
+if (ADNI_sample %in% c("ADNI1", "ADNI2", "ADNIGO")){
+  d_reccmeds <- reccmeds %>% 
+    filter((VISCODE %in% c("bl","sc")) & (ORIGPROT==ADNI_sample)) %>% 
+    dplyr::select(RID, CMREASON, CMCOMM, VISCODE, ORIGPROT)
+} else if (ADNI_sample == "ADNI2 & ADNIGO"){
+    d_reccmeds <- reccmeds %>% 
+      filter((VISCODE %in% c("bl","sc")) & (ORIGPROT!="ADNI1")) %>% 
+      dplyr::select(RID, CMREASON, CMCOMM, VISCODE, ORIGPROT)
+}
+
+
+reccmends_vars <- c("diabet", "cholesterol", "atrial fibrillation", 
+                    "osteoporosis", "angina", "prostate", "arthritis","cataract")
+
+d_reccmeds_sorted <- data.frame(RID = sort(unique(d_reccmeds$RID)))
+
+for (var in reccmends_vars)
+{
+    # search for relevant word from the combination of CMREASON and CMCOMM
+    d_tmp <- d_reccmeds %>% mutate(CM_combined = paste(CMREASON, CMCOMM, sep = " | ")) %>% 
+      mutate(str_exist = str_detect(tolower(CM_combined), var)) %>% 
+      mutate(str_exist = ifelse(CM_combined=="NA | NA", NA, str_exist)) %>% 
+      group_by(RID) %>% summarise(n = sum(as.numeric(str_exist)))
+    
+    # convert to binarized variable
+    d_tmp[which(d_tmp[,"n"]>1), "n"] <- 1
+    
+    # code missing values as 0
+    d_tmp[which(is.na(d_tmp[,"n"])), "n"] <- 0
+    
+    names(d_tmp)[which(names(d_tmp)=="n")] <- var
+    
+    # add to the main data frame
+    d_reccmeds_sorted <- d_reccmeds_sorted %>%  inner_join(d_tmp, by = "RID")
+}
+
+d <- left_join(d, d_reccmeds_sorted, by = "RID")
+
+# add polypharmacy variable
+
+if (ADNI_sample %in% c("ADNI1", "ADNI2", "ADNIGO")){
+  d_tmp <- reccmeds %>% filter((VISCODE=="sc") & (ORIGPROT==ADNI_sample)) %>%
+    mutate(CM_combined = paste(CMREASON, CMCOMM, sep = " | ")) %>% 
+    mutate(non_supplement_health = as.numeric(!str_detect(tolower(CM_combined), "supplement|health"))) %>% 
+    group_by(RID) %>% summarise(polypharmacy=sum(non_supplement_health))
+} else if (ADNI_sample == "ADNI2 & ADNIGO"){
+  d_tmp <- reccmeds %>% filter((VISCODE=="sc") & (ORIGPROT!="ADNI1")) %>%
+    mutate(CM_combined = paste(CMREASON, CMCOMM, sep = " | ")) %>% 
+    mutate(non_supplement_health = as.numeric(!str_detect(tolower(CM_combined), "supplement|health"))) %>% 
+    group_by(RID) %>% summarise(polypharmacy=sum(non_supplement_health))
+}
+
+
+d <- d %>% left_join(d_tmp, by="RID")
+
+# add BP and THYROXINE from the reccmeds table
+if (ADNI_sample %in% c("ADNI1", "ADNI2", "ADNIGO")){
+  d_tmp <- reccmeds %>% filter((VISCODE=="sc") & (ORIGPROT==ADNI_sample)) %>%
+    group_by(RID) %>% 
+    summarise(Rx_hypertension = as.numeric(sum(BP)>0), Drug_hypothyroidism = as.numeric(sum(THYROXINE)>0))
+} else if (ADNI_sample == "ADNI2 & ADNIGO"){
+  d_tmp <- reccmeds %>% filter((VISCODE=="sc") & (ORIGPROT!="ADNI1")) %>%
+    group_by(RID) %>% 
+    summarise(Rx_hypertension = as.numeric(sum(BP)>0), Drug_hypothyroidism = as.numeric(sum(THYROXINE)>0))
+}
+
+  
+d <- d %>% left_join(d_tmp, by="RID")
+
+# add variables that do not follow the 0/1 rules
+vars_softrule <- c("FAQFINAN", "FAQFORM", "FAQSHOP", "FAQGAME", "FAQBEVG", "FAQMEAL", "FAQEVENT", "FAQTV", "FAQREM", "FAQTRAVL")
+
+for (var in vars_softrule)
+{
+    
+    #if (ADNI_sample == "ADNI1"){
+    if (ADNI_sample %in% c("ADNI1", "ADNI2", "ADNIGO")){
+      tmp <- faq %>% filter(VISCODE=="bl" & ORIGPROT==ADNI_sample)
+    } else if (ADNI_sample == "ADNI2 & ADNIGO"){
+      tmp <- faq %>% filter(VISCODE=="bl" & ORIGPROT!="ADNI1")
+      #tmp <- faq %>% filter(VISCODE=="sc" & ORIGPROT!="ADNI1")
+    }
+    
+    names(tmp)[which(names(tmp)==var)] <- "var_faq"
+
+    # extract number from the entire string
+    tmp <- tmp %>% dplyr::select(RID, var_faq) %>%
+      mutate(var_tmp = as.numeric(gsub("\\(|\\)","",str_extract(tmp$var_faq, "\\([[:digit:]]\\)")))) %>%
+      mutate(var = var_tmp)
+
+    tmp[which(tmp[, "var_tmp"] == 3), "var"] <- 1
+    tmp[which(tmp[, "var_tmp"] == 2), "var"] <- 0.5
+    tmp[which(tmp[, "var_tmp"] == 1), "var"] <- 0.25
+
+    # add to the main frame
+    d <- d %>% left_join(tmp[, c("RID","var")], by = "RID")
+    names(d)[which(names(d)=="var")] <- paste0(var, "_FI_binarized")
+}
+
+
+# add CDMEMORY
+d <- add_variables_to_main_df(d, format_tidy_var_tab(cdr, varsOI = "CDMEMORY", examdate_suffix = "cdr", sample_size = d_demo_size)) %>% 
+  mutate(CDR_Subscale_Memory_FI_binarized = ifelse(CDMEMORY>0.5, 1, CDMEMORY)) %>% 
+  dplyr::select(-CDMEMORY)
+
+# start off with "incorrect" thresholds (update later in script)
+labdata_add_vars <- list()
+labdata_add_vars[["RCT392"]]["new_name"] <- "Lab_Blood_Creatinine_FI"
+labdata_add_vars[["RCT392"]]["male_lower"] <- 0.68
+labdata_add_vars[["RCT392"]]["male_upper"] <- 1.24
+labdata_add_vars[["RCT392"]]["female_lower"] <- 0.51
+labdata_add_vars[["RCT392"]]["female_upper"] <- 1.02
+
+labdata_add_vars[["HMT40"]]["new_name"] <- "Lab_Blood_HGB_FI"
+labdata_add_vars[["HMT40"]]["male_lower"] <- 13.5
+labdata_add_vars[["HMT40"]]["male_upper"] <- 18
+labdata_add_vars[["HMT40"]]["female_lower"] <- 12
+labdata_add_vars[["HMT40"]]["female_upper"] <- 16
+
+labdata_add_vars[["RCT8"]]["new_name"] <- "Lab_Blood_Uric_Acid_FI"
+labdata_add_vars[["RCT8"]]["male_lower"] <- 2.71
+labdata_add_vars[["RCT8"]]["male_upper"] <- 5.77
+labdata_add_vars[["RCT8"]]["female_lower"] <- 1.81
+labdata_add_vars[["RCT8"]]["female_upper"] <- 4.86
+
+d <- add_variables_to_main_df(d, format_tidy_var_tab(labdata,varsOI = names(labdata_add_vars), examdate_suffix = "", sample_size = d_demo_size))
+
+
+for (var in names(labdata_add_vars))
+{
+    new_name <- labdata_add_vars[[var]]["new_name"]
+    d[,new_name] <- as.numeric(remove_weird_character_values(d[,var]))
+
+    # binarize
+    d[, paste0(new_name,"_binarized")] <- d[, new_name]
+
+    idx_male <- which(d$Sex=="Male")
+    idx_female <- which(d$Sex=="Female")
+
+    # male
+    d[idx_male, paste0(new_name,"_binarized")] <-
+      ifelse(d[idx_male, new_name] >= labdata_add_vars[[var]]["male_lower"] &
+               d[idx_male, new_name] <= labdata_add_vars[[var]]["male_upper"], 0, 1)
+
+    # female
+    d[idx_female, paste0(new_name,"_binarized")] <-
+      ifelse(d[idx_female, new_name] >= labdata_add_vars[[var]]["female_lower"] &
+               d[idx_female, new_name] <= labdata_add_vars[[var]]["female_upper"], 0, 1)
+}
+
+# Add MMSE
+d$MMSE_FI_binarized <- NA
+d$MMSE_FI_binarized[d$MMSE.bl<10] <- 1
+d$MMSE_FI_binarized[d$MMSE.bl>10 & d$MMSE.bl<=17] <- 0.75
+d$MMSE_FI_binarized[d$MMSE.bl>18 & d$MMSE.bl<=20] <- 0.5
+d$MMSE_FI_binarized[d$MMSE.bl>20 & d$MMSE.bl<=24] <- 0.25
+d$MMSE_FI_binarized[d$MMSE.bl>24] <- 0
+
+# binarize
+
+feats_all <- c(vars_mapping$new_name)
+
+for (feat in feats_all)
+{
+
+  feat_new <- paste0(feat, "_binarized")
+  d[, feat] <- remove_weird_character_values(d[,feat])
+  tmp <- convert_threshold_value_2_binary(feat = d[, feat], mapping = vars_mapping %>% filter(new_name==feat))
+  d[, feat_new] <- tmp
+}
+
+```
+
+
+```{r modify_lab_binarized}
+
+# modify thresholds from previous chunks
+
+calc_cutoff <- function(FI_var, var_cut=c(1,2)){
+  
+  FI_var <- as.numeric(FI_var) 
+  FI_var_binarized <- rep(NA, length(FI_var))
+  
+  for (i in 1:length(FI_var)){
+    if (!is.na(FI_var[i])){
+      if (FI_var[i] >= var_cut[1] & FI_var[i] < var_cut[2]){
+        FI_var_binarized[i] <- 0
+      } else {
+        FI_var_binarized[i] <-1
+      }
+    }
+  }
+  
+  
+  return(FI_var_binarized)
+}
+
+
+gender_cutoff <- function(FI_var, Sex="Male", 
+                          var_cut_male=c(1,2),
+                          var_cut_female=c(3,4)){
+  
+  FI_var <- as.numeric(FI_var) 
+  FI_var_binarized <- rep(NA, length(FI_var))
+  
+  for (i in 1:length(FI_var)){
+    if (!is.na(FI_var[i])){
+      if (Sex[i] == "Male"){
+        if (FI_var[i] >= var_cut_male[1] & FI_var[i] < var_cut_male[2]){
+          FI_var_binarized[i] <- 0
+        } else {
+          FI_var_binarized[i] <-1
+        }
+        
+      } else { #Female
+        if (FI_var[i] >= var_cut_female[1] & FI_var[i] < var_cut_female[2]){
+          FI_var_binarized[i] <- 0
+        } else {
+          FI_var_binarized[i] <-1
+        }
+      }
+    }
+  }
+  
+  
+  return(FI_var_binarized)
+}
+
+
+
+two_age_cutoff <- function(FI_var, Age=18, 
+                           Age_band=c(1,2,3),
+                           var_cut_low=c(1,2),
+                           var_cut_old=c(3,4)){
+  
+  FI_var <- as.numeric(FI_var) 
+  FI_var_binarized <- rep(NA, length(FI_var))
+  
+  for (i in 1:length(FI_var)){
+    if (!is.na(FI_var[i])){
+      
+      if (Age[i] >= Age_band[1] & Age[i] < Age_band[2]){
+        if (FI_var[i] >= var_cut_low[1] & FI_var[i] < var_cut_low[2]){
+          FI_var_binarized[i] <- 0
+        } else {
+          FI_var_binarized[i] <- 1
+        }
+        
+      } else if (Age[i] >= Age_band[2] & Age[i] < Age_band[3]){
+        if (FI_var[i] >= var_cut_old[1] & FI_var[i] < var_cut_old[2]){
+          FI_var_binarized[i] <- 0
+        } else {
+          FI_var_binarized[i] <- 1
+        }
+        
+      }
+    }
+    
+    
+    
+  }
+  
+  return(FI_var_binarized)
+  
+  
+}
+
+
+three_age_cutoff <- function(FI_var, Age=18, 
+                             Age_band=c(1,2,3,4),
+                             var_cut_low=c(1,2),
+                             var_cut_mid=c(2,3),
+                             var_cut_old=c(3,4)){
+  
+  FI_var <- as.numeric(FI_var) 
+  FI_var_binarized <- rep(NA, length(FI_var))
+  
+  for (i in 1:length(FI_var)){
+    if (!is.na(FI_var[i])){
+      
+      if (Age[i] >= Age_band[1] & Age[i] < Age_band[2]){
+        if (FI_var[i] >= var_cut_low[1] & FI_var[i] < var_cut_low[2]){
+          FI_var_binarized[i] <- 0
+        } else {
+          FI_var_binarized[i] <- 1
+        }
+      } else if (Age[i] >= Age_band[2] & Age[i] < Age_band[3] ){
+        if (FI_var[i] >= var_cut_mid[1] & FI_var[i] < var_cut_mid[2]){
+          FI_var_binarized[i] <- 0
+        } else {
+          FI_var_binarized[i] <- 1
+        }
+      } else if (Age[i] >= Age_band[3] & Age[i] < Age_band[4]){
+        if (FI_var[i] >= var_cut_old[1] & FI_var[i] < var_cut_old[2]){
+          FI_var_binarized[i] <- 0
+        } else {
+          FI_var_binarized[i] <- 1
+        }
+        
+      }
+    }
+    
+    
+    
+    
+    
+  }
+  
+  return(FI_var_binarized)
+  
+  
+}
+
+
+
+two_age_and_gender_cutoff <- function(FI_var,Sex="Male", Age=18, 
+                                      Age_band=c(1,2,3),
+                                      var_cut_male_low=c(1,2),
+                                      var_cut_male_old=c(3,4),
+                                      var_cut_female_low=c(3,4),
+                                      var_cut_female_old=c(3,4)){
+  
+  FI_var <- as.numeric(FI_var) 
+  FI_var_binarized <- rep(NA, length(FI_var))
+  
+  for (i in 1:length(FI_var)){
+    if (!is.na(FI_var[i])){
+      if (Sex[i] == "Male"){
+        if (Age[i] >= Age_band[1] & Age[i] < Age_band[2]){
+          if (FI_var[i] >= var_cut_male_low[1] & FI_var[i] < var_cut_male_low[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        } else if (Age[i] >= Age_band[2] & Age[i] < Age_band[3]){
+          if (FI_var[i] >= var_cut_male_old[1] & FI_var[i] < var_cut_male_old[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        }
+      } else { #Female
+        if (Age[i] >= Age_band[1] & Age[i] < Age_band[2]){
+          if (FI_var[i] >= var_cut_female_low[1] & FI_var[i] < var_cut_female_low[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        } else if (Age[i] >= Age_band[2] & Age[i] < Age_band[3]){
+          if (FI_var[i] >= var_cut_female_old[1] & FI_var[i] < var_cut_female_old[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        }
+      }
+      
+    }
+  }
+  
+  
+  
+  return(FI_var_binarized)
+}
+
+
+
+three_age_and_gender_cutoff <- function(FI_var,Sex="Male", Age=18, 
+                                        Age_band=c(1,2,3,4),
+                                        var_cut_male_low=c(1,2),
+                                        var_cut_male_mid=c(2,3),
+                                        var_cut_male_old=c(3,4),
+                                        var_cut_female_low=c(1,2),
+                                        var_cut_female_mid=c(2,3),
+                                        var_cut_female_old=c(3,4)){
+  
+  FI_var <- as.numeric(FI_var) 
+  FI_var_binarized <- rep(NA, length(FI_var))
+  
+  for (i in 1:length(FI_var)){
+    if (!is.na(FI_var[i])){
+      
+      if (Sex[i] == "Male"){
+        if (Age[i] >= Age_band[1] & Age[i] < Age_band[2]){
+          if (FI_var[i] >= var_cut_male_low[1] & FI_var[i] < var_cut_male_low[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        } else if (Age[i] >= Age_band[2] & Age[i] < Age_band[3] ){
+          if (FI_var[i] >= var_cut_male_mid[1] & FI_var[i] < var_cut_male_mid[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        } else if (Age[i] >= Age_band[3] & Age[i] < Age_band[4]){
+          if (FI_var[i] >= var_cut_male_old[1] & FI_var[i] < var_cut_male_old[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        }
+      } else { #Female
+        if (Age[i] >= Age_band[1] & Age[i] < Age_band[2]){
+          if (FI_var[i] >= var_cut_female_low[1] & FI_var[i] < var_cut_female_low[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        } else if (Age[i] >= Age_band[2] & Age[i] < Age_band[3] ){
+          if (FI_var[i] >= var_cut_female_mid[1] & FI_var[i] < var_cut_female_mid[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        } else if (Age[i] >= Age_band[3] & Age[i] < Age_band[4]){
+          if (FI_var[i] >= var_cut_female_old[1] & FI_var[i] < var_cut_female_old[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        }
+      }
+      
+    }
+  }
+  
+  
+  
+  
+  return(FI_var_binarized)
+}
+
+
+
+
+five_age_and_gender_cutoff <- function(FI_var, Sex="Male", Age=18, 
+                                       Age_band=c(1,2,3,4,5,6),
+                                       var_cut_male_low=c(1,2),
+                                       var_cut_male_midlow=c(2,3),
+                                       var_cut_male_mid=c(2,3), 
+                                       var_cut_male_midold=c(2,3),
+                                       var_cut_male_old=c(3,4),
+                                       var_cut_female_low=c(1,2),
+                                       var_cut_female_midlow=c(2,3),
+                                       var_cut_female_mid=c(2,3),
+                                       var_cut_female_midold=c(2,3), 
+                                       var_cut_female_old=c(3,4)){
+  
+  FI_var <- as.numeric(FI_var) 
+  FI_var_binarized <- rep(NA, length(FI_var))
+  
+  for (i in 1:length(FI_var)){
+    if (!is.na(FI_var[i])){
+      
+      if (Sex == "Male"){
+        if (Age[i] >= Age_band[1] & Age[i] < Age_band[2]){
+          if (FI_var[i] >= var_cut_male_low[1] & FI_var[i] < var_cut_male_low[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        } else if (Age[i] >= Age_band[2] & Age[i] < Age_band[3] ){
+          if (FI_var[i] >= var_cut_male_midlow[1] & FI_var[i] < var_cut_male_midlow[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+          
+        } else if (Age[i] >= Age_band[3] & Age[i] < Age_band[4] ){
+          if (FI_var[i] >= var_cut_male_mid[1] & FI_var[i] < var_cut_male_mid[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+          
+        } else if (Age[i] >= Age_band[4] & Age[i] < Age_band[5] ){
+          if (FI_var[i] >= var_cut_male_midold[1] & FI_var[i] < var_cut_male_midold[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+          
+          
+        } else if (Age[i] >= Age_band[5] & Age[i] < Age_band[6]){
+          if (FI_var[i] >= var_cut_male_old[1] & FI_var[i] < var_cut_male_old[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        }
+      } else { #Female
+        if (Age[i] >= Age_band[1] & Age[i] < Age_band[2]){
+          if (FI_var[i] >= var_cut_female_low[1] & FI_var[i] < var_cut_female_low[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+          
+        } else if (Age[i] >= Age_band[2] & Age[i] < Age_band[3] ){
+          if (FI_var[i] >= var_cut_female_midlow[1] & FI_var[i] < var_cut_female_midlow[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+          
+          
+        } else if (Age[i] >= Age_band[3] & Age[i] < Age_band[4] ){
+          if (FI_var[i] >= var_cut_female_mid[1] & FI_var[i] < var_cut_female_mid[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+          
+        } else if (Age[i] >= Age_band[4] & Age[i] < Age_band[5] ){
+          if (FI_var[i] >= var_cut_female_midold[1] & FI_var[i] < var_cut_female_midold[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+          
+        } else if (Age[i] >= Age_band[5] & Age[i] < Age_band[6]){
+          if (FI_var[i] >= var_cut_female_old[1] & FI_var[i] < var_cut_female_old[2]){
+            FI_var_binarized[i] <- 0
+          } else {
+            FI_var_binarized[i] <- 1
+          }
+        }
+      }
+      
+    }
+  }
+  
+  
+  
+  return(FI_var_binarized)
+}
+
+
+
+
+d$Lab_Blood_Albumin_binarized <- three_age_cutoff(FI_var=d$Lab_Blood_Albumin,
+                                                  Age=d$Age,
+                                                  Age_band=c(18, 69, 80, 150),
+                                                  var_cut_low=c(3.3, 4.9),
+                                                  var_cut_mid=c(3.3, 4.6),
+                                                  var_cut_old=c(3.0, 4.6))
+
+
+d$Lab_Blood_ALT_binarized  <- two_age_and_gender_cutoff(FI_var = d$Lab_Blood_ALT,
+                                                        Sex=d$Sex, Age=d$Age,
+                                                        Age_band = c(18, 69, 150),
+                                                        var_cut_male_low = c(6, 43),
+                                                        var_cut_male_old = c(6, 35),
+                                                        var_cut_female_low = c(6, 34),
+                                                        var_cut_female_old = c(6, 32))
+
+ 
+d$Lab_Blood_AST_binarized <- gender_cutoff(FI_var = d$Lab_Blood_AST,
+                                           Sex=d$Sex,
+                                           var_cut_male = c(9, 34),
+                                           var_cut_female = c(11, 36))
+
+
+d$Lab_Blood_Cholesterol_binarized <- three_age_and_gender_cutoff(FI_var = d$Lab_Blood_Cholesterol,
+                                                       Sex = d$Sex, Age = d$Age,
+                                                       Age_band = c(50, 60, 70, 150),
+                                                       var_cut_male_low = c(170, 291),
+                                                       var_cut_male_mid = c(175, 298),
+                                                       var_cut_male_old = c(177, 300),
+                                                       var_cut_female_low = c(171, 291),
+                                                       var_cut_female_mid = c(188, 320),
+                                                       var_cut_female_old = c(207, 352))
+
+
+d$Lab_Blood_Glucose_binarized <- two_age_cutoff(FI_var = d$Lab_Blood_Glucose,
+                                                Age = d$Age, Age_band = c(18, 59, 150),
+                                                var_cut_low = c(70, 115),
+                                                var_cut_old = c(70, 120))
+
+
+d$Lab_Blood_HCT_binarized <- two_age_and_gender_cutoff(FI_var = d$Lab_Blood_HCT,
+                                                       Sex = d$Sex, Age = d$Age, 
+                                                       Age_band = c(12, 59, 150),
+                                                       var_cut_male_low = c(39, 54),
+                                                       var_cut_male_old = c(37, 51),
+                                                       var_cut_female_low = c(34, 48),
+                                                       var_cut_female_old = c(34,48))
+
+
+d$Lab_Blood_Calcium_binarized <- calc_cutoff(FI_var = d$Lab_Blood_Calcium,
+                                             var_cut = c(8.3, 10.6))
+
+
+d$Lab_Blood_LDH_binarized <- calc_cutoff(FI_var = d$Lab_Blood_LDH,
+                                         var_cut = c(53, 234))
+
+
+d$Lab_Blood_MCH_binarized <- calc_cutoff(FI_var = d$Lab_Blood_MCH,
+                                         var_cut = c(26, 34))
+
+
+ 
+d$Lab_Blood_MCHC_binarized <- calc_cutoff(FI_var = d$Lab_Blood_MCHC,
+                                          var_cut = c(31, 38))
+
+
+d$Lab_Blood_MCV_binarized <- two_age_and_gender_cutoff(FI_var = d$Lab_Blood_MCV,
+                                                       Sex = d$Sex, Age = d$Age, 
+                                                       Age_band = c(12, 59, 150),
+                                                       var_cut_male_low = c(79, 96),
+                                                       var_cut_male_old = c(80, 100),
+                                                       var_cut_female_low = c(79, 98),
+                                                       var_cut_female_old = c(80, 100))
+
+
+d$Lab_Blood_RBC_binarized <- two_age_and_gender_cutoff(FI_var = d$Lab_Blood_RBC,
+                                                       Sex = d$Sex, Age = d$Age, 
+                                                       Age_band = c(12, 59, 150),
+                                                       var_cut_male_low = c(4.5, 6.4),
+                                                       var_cut_male_old = c(4.0, 5.8),
+                                                       var_cut_female_low = c(4.1, 5.6),
+                                                       var_cut_female_old = c(3.9, 5.5))
+
+
+d$Lab_Blood_Protein_Total_binarized <- two_age_cutoff(FI_var = d$Lab_Blood_Protein_Total,
+                                                      Age = d$Age, 
+                                                      Age_band = c(18, 59, 150),
+                                                      var_cut_low = c(6.1, 8.4),
+                                                      var_cut_old = c(6, 8))
+
+
+
+d$Lab_Blood_Urea_Nitrogen <- three_age_cutoff(FI_var = d$Lab_Blood_Urea_Nitrogen,
+                                              Age = d$Age,
+                                              Age_band = c(18, 70, 80, 150),
+                                              var_cut_low = c(4, 24),
+                                              var_cut_mid = c(4, 29),
+                                              var_cut_old = c(4, 34))
+
+
+d$Lab_Blood_ALP_binarized <- five_age_and_gender_cutoff(FI_var = d$Lab_Blood_ALP,
+                                     Sex = d$Sex,
+                                     Age = d$Age,
+                                     Age_band = c(50, 60, 70, 80, 90, 150),
+                                     var_cut_male_low = c(35, 131),
+                                     var_cut_male_midlow = c(35, 125),
+                                     var_cut_male_mid = c(35, 130),
+                                     var_cut_male_midold = c(35, 125),
+                                     var_cut_male_old = c(35, 125),
+                                     var_cut_female_low = c(35, 123),
+                                     var_cut_female_midlow = c(35, 123),
+                                     var_cut_female_mid = c(35, 135),
+                                     var_cut_female_midold = c(35, 135),
+                                     var_cut_female_old = c(35, 140))
+
+
+d$Lab_Blood_Phosphorus_binarized <- calc_cutoff(FI_var = d$Lab_Blood_Phosphorus,
+                                                var_cut = c(2.2, 5.1))
+
+
+d$Lab_Blood_Platelets_binarized <- two_age_cutoff(FI_var = d$Lab_Blood_Platelets,
+                         Age = d$Age, 
+                         Age_band = c(12, 60, 150),
+                         var_cut_low = c(140, 400),
+                         var_cut_old = c(130, 394))
+
+
+d$Lab_Blood_Neutrophils_count_binarized <- calc_cutoff(FI_var = d$Lab_Blood_Neutrophils_count,
+                                                       var_cut = c(1.96, 7.23))
+
+
+
+d$Lab_Blood_Triglyceride_binarized <- two_age_and_gender_cutoff(FI_var = d$Lab_Blood_Triglyceride,
+                                                       Sex = d$Sex, Age = d$Age, 
+                                                       Age_band = c(50, 60, 150),
+                                                       var_cut_male_low = c(58, 320),
+                                                       var_cut_male_old = c(58, 260),
+                                                       var_cut_female_low = c(52, 262),
+                                                       var_cut_female_old = c(56, 240))
+
+
+d$Lab_Blood_B12_binarized <- calc_cutoff(FI_var = d$Lab_Blood_B12,
+                                         var_cut = c(180, 914))
+
+
+d$Lab_Blood_TSH_binarized <- calc_cutoff(FI_var = d$Lab_Blood_TSH,
+                                         var_cut = c(0.32, 5.0))
+
+
+
+d$Lab_Blood_Creatinine_FI_binarized <- three_age_and_gender_cutoff(FI_var = d$Lab_Blood_Creatinine_FI,
+                                                       Sex = d$Sex, Age = d$Age,
+                                                       Age_band = c(50, 70, 80, 150),
+                                                       var_cut_male_low = c(0.5, 1.3),
+                                                       var_cut_male_mid = c(0.5, 1.5),
+                                                       var_cut_male_old = c(0.5, 1.6),
+                                                       var_cut_female_low = c(0.4, 1.1),
+                                                       var_cut_female_mid = c(0.4, 1.2),
+                                                       var_cut_female_old = c(0.4, 1.4))
+
+
+d$Lab_Blood_HGB_FI_binarized <- two_age_and_gender_cutoff(FI_var = d$Lab_Blood_HGB_FI,
+                                                       Sex = d$Sex, Age = d$Age, 
+                                                       Age_band = c(12, 59, 150),
+                                                       var_cut_male_low = c(12.7, 18.1),
+                                                       var_cut_male_old = c(12.5, 17.0),
+                                                       var_cut_female_low = c(11.6, 16.4),
+                                                       var_cut_female_old = c(11.5, 15.8))
+
+
+d$Lab_Blood_Uric_Acid_FI_binarized <- gender_cutoff(FI_var = d$Lab_Blood_Uric_Acid_FI,
+                                                    Sex=d$Sex,
+                                                    var_cut_male = c(2.5, 8.3),
+                                                    var_cut_female = c(2.5, 7.5))
+
+```
+
+
+# Extract HC -> MCI, MCI -> AD conversion info and merege to main data frame
+
+```{r prepare_data_4_Cox_regression_updated}
+
+# load coxreg data, and exclude ADNI3 (RID > 6000)
+dxsum_new <- ADNIMERGE::dxsum %>% 
+  dplyr::filter(RID < 6000) %>% 
+  dplyr:: filter(ORIGPROT != "ADNI3")
+
+dxsum_new <- dxsum_new %>% 
+  rename(EXAMDATE_DXSUM = EXAMDATE)
+
+registry_new <- ADNIMERGE::registry %>% 
+  dplyr::select(RID, ORIGPROT, EXAMDATE, VISCODE)
+
+
+# Merge dxsum_new with registry_new
+dxsum_new <- merge(dxsum_new, registry_new, by = c("RID", "ORIGPROT", "VISCODE"))
+
+# get rid of rows with empty EXAMDATE (based on "registry")
+dxsum_new <- dxsum_new[!is.na(dxsum_new$EXAMDATE), ]
+
+
+
+
+# Create DXCHANGE_text where some values in DXCHANGE are "equivalent"
+dxsum_new$DXCHANGE_text <- dxsum_new$DXCHANGE
+dxsum_new$DXCHANGE_text[dxsum_new$DXCHANGE_text == "Stable: NL to NL"] <- "Stable: NL"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCHANGE_text == "Stable: MCI to MCI"] <- "Stable: MCI"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCHANGE_text == "Stable: Dementia to Dementia"] <- "Stable: AD"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCHANGE_text == "Stable: Dementia"] <- "Stable: AD"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCHANGE_text == "Conversion: MCI to Dementia"] <- "Conversion: MCI to AD"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCHANGE_text == "Conversion: NL to Dementia"] <- "Conversion: NL to AD"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCHANGE_text == "Reversion: Dementia to MCI"] <- "Reversion: AD to MCI"
+
+
+
+dxsum_new$DXCHANGE_text[dxsum_new$DXCONV=="No" & dxsum_new$DXCURREN=="NL"] = "Stable: NL"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCONV=="No" & dxsum_new$DXCURREN=="MCI"] = "Stable: MCI"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCONV=="No" & dxsum_new$DXCURREN=="AD"] = "Stable: AD"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCONV=="Yes - Conversion" & dxsum_new$DXCONTYP=="Normal Control to MCI"] = "Conversion: NL MCI"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCONV=="Yes - Conversion" & dxsum_new$DXCONTYP=="MCI to AD"] = "Conversion: MCI to AD"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCONV=="Yes - Conversion" & dxsum_new$DXCONTYP=="Normal Control to AD"] = "Conversion: NL to AD"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCONV=="Yes - Reversion" & dxsum_new$DXREV=="MCI to Normal Control"] = "Reversion: MCI to NL"
+dxsum_new$DXCHANGE_text[dxsum_new$DXCONV=="Yes - Reversion" & dxsum_new$DXREV=="AD to MCI"] = "Reversion: AD to MCI"
+ 
+
+
+
+
+
+identify_conversion <- function (rid, baseline_label)
+{
+
+    if (baseline_label=="Stable: NL"){
+      conversion_text = "Conversion: NL to MCI"
+    } else if (baseline_label=="Stable: MCI") {
+      conversion_text = "Conversion: MCI to AD"
+    }
+
+
+    if (ADNI_sample %in% c("ADNI1", "ADNI2", "ADNIGO")){
+      res <- dxsum_new %>% filter(ORIGPROT == ADNI_sample & (RID %in% rid)) %>%
+        filter(DXCHANGE_text == conversion_text) %>%
+        dplyr::select(RID, DXCHANGE_text, EXAMDATE) %>%
+        rename(EXAMDATE_follow = EXAMDATE)
+    } else if (ADNI_sample == "ADNI2 & ADNIGO") {
+      res <- dxsum_new %>% filter(ORIGPROT != "ADNI1" & (RID %in% rid)) %>%
+        filter(DXCHANGE_text == conversion_text) %>%
+        dplyr::select(RID, DXCHANGE_text, EXAMDATE) %>%
+        rename(EXAMDATE_follow = EXAMDATE)
+    }
+
+    
+    #if no conversion is found in any of the follow-up, then Dx is stable (same as baseline)
+    if (nrow(res) == 0) 
+    {
+
+        # find the time of the final followup
+        if (ADNI_sample %in% c("ADNI1", "ADNI2", "ADNIGO")){
+          last_followup_time = dxsum_new %>% filter(ORIGPROT == ADNI_sample & (RID %in% rid) & (VISCODE != "bl")) %>%
+            mutate(followup_month = gsub("[[:alpha:]]", "", VISCODE)) %>%
+            filter(followup_month == max(followup_month)) %>%
+            dplyr::select(EXAMDATE) %>% as.vector
+        } else if (ADNI_sample == "ADNI2 & ADNIGO"){
+          last_followup_time = dxsum_new %>% filter(ORIGPROT != "ADNI1" & (RID %in% rid) & (VISCODE != "bl")) %>%
+            mutate(followup_month = gsub("[[:alpha:]]", "", VISCODE)) %>%
+            filter(followup_month == max(followup_month)) %>%
+            dplyr::select(EXAMDATE) %>% as.vector
+        }
+
+
+        if (nrow(last_followup_time) == 0)
+        {
+            if (ADNI_sample %in% c("ADNI1", "ADNI2", "ADNIGO")){
+              last_followup_time = dxsum_new %>% filter(ORIGPROT == ADNI_sample & (RID %in% rid) & (VISCODE == "bl")) %>%
+                dplyr::select(EXAMDATE)
+            } else if (ADNI_sample == "ADNI2 & ADNIGO"){
+              last_followup_time = dxsum_new %>% filter(ORIGPROT != "ADNI1" & (RID %in% rid) & (VISCODE == "bl")) %>%
+                dplyr::select(EXAMDATE)
+            }
+
+
+        } # this subject only has baseline data
+
+        res <- data.frame(RID=rid, DXCHANGE_text=baseline_label, EXAMDATE_follow = last_followup_time$EXAMDATE)
+    }
+
+    res
+}
+
+
+
+if (ADNI_sample %in% c("ADNI1", "ADNI2", "ADNIGO")){
+  bl <- dxsum_new %>%
+    filter(ORIGPROT==ADNI_sample & VISCODE=="bl" & ((DXCHANGE_text=="Stable: NL") | (DXCHANGE_text=="Stable: MCI") )) %>%
+    dplyr::select(RID, DXCHANGE_text, EXAMDATE)
+} else if (ADNI_sample =="ADNI2 & ADNIGO"){
+  bl <- dxsum_new %>%
+    filter(ORIGPROT!="ADNI1" & VISCODE=="bl" & ((DXCHANGE_text=="Stable: NL") | (DXCHANGE_text=="Stable: MCI") )) %>%
+      dplyr::select(RID, DXCHANGE_text, EXAMDATE)
+}
+
+res <- data.frame(matrix(NA, nrow = 0, ncol = 4))
+names(res) <- c("RID", "DXCHANGE_text", "EXAMDATE_bl", "EXAMDATE_follow")
+
+res$EXAMDATE_bl <- as.Date(res$EXAMDATE_bl)
+res$EXAMDATE_follow <- as.Date(res$EXAMDATE_follow)
+res$DXCHANGE_text <- factor(res$DXCHANGE_text)
+
+
+for (n in 1:nrow(bl))
+{
+  rid = bl[n, "RID"]
+  baseline_label = bl[n, "DXCHANGE_text"]
+  res_tmp = identify_conversion(rid, baseline_label)
+  res_tmp["EXAMDATE_bl"] = bl[n, "EXAMDATE"]
+
+
+  res <- bind_rows(res, res_tmp)
+
+}
+
+# compute differences in number of days
+res <- res %>% mutate(EXAMDATE_bl = as.Date(as.character(EXAMDATE_bl)),
+                      EXAMDATE_follow = as.Date(as.character(EXAMDATE_follow)),
+                      Coxreg_update_time_conversion = EXAMDATE_follow - EXAMDATE_bl) %>%
+  rename(Coxreg_update_EXAMDATE_bl = EXAMDATE_bl,
+         Coxreg_update_EXAMDATE_follow = EXAMDATE_follow,
+         Coxreg_update_DXCHANGE_text = DXCHANGE_text)
+
+
+res["Coxreg_update_status"] = 0
+res[grep("Conversion", res$Coxreg_update_DXCHANGE_text), "Coxreg_update_status"] = 1
+
+res$RID <- as.numeric(res$RID)
+res <- res %>%
+  arrange(RID, Coxreg_update_time_conversion)
+
+# remove duplicates. For some reasons, "DXCHANGE" was "Conversion..." at more than one visits --> fine to remove rows corresponding to the latter visit(s)
+res <- res[-which(duplicated(res[,"RID"])), ]
+
+d <- d %>% left_join(res, by = "RID")
+
+```
+
+
+
+
+## Sample characteristics
+
+```{r echo = F}
+count(d, Dx)
+count(d, Dx, Sex)
+d %>% group_by(Dx) %>% summarise(m=mean(Age), sd = sd(Age), min=min(Age), max=max(Age))
+
+p <- ggplot(data = d, aes(x = Age, colour = Dx, fill = Dx)) 
+p + geom_histogram() + ggtitle("Age histogram") + my_theme
+```
+
+## Exclude based on sample-based prevalance
+
+Any variables with a prevelance of 1% of "frailty" value in the cohort are excluded. 
+<br>
+<br>
+`r filter_one_percent`
+<br>
+<br>
+if TRUE is displayed above, then this rule is based on thes sample excluding
+<br>
+AD. If FALSE, then it is on the total sample
+<br>
+Note: this is assessed on ALL "variables", not just what is included in list_frailty_indices.csv
+<br>
+The following ones survives this criteria:
+
+```{r}
+
+# perform frequency check
+feats_all_binarized <- names(d)[str_detect(names(d),"_binarized$")]
+feats_all_binarized <- feats_all_binarized[!feats_all_binarized %in% c("FAQTOTAL_FI_binarized")]
+feats_all <- gsub(pattern = "_binarized", "", feats_all_binarized) #Luigi: doesn't get used for anything?
+
+
+
+one_percent_rule <- function(data, filter_AD=FALSE, verbose=TRUE){
+  
+  feats_all_lowFreqExcl <- c()
+  
+  for (feat in feats_all_binarized)
+  {
+      
+      if (verbose)  print(paste0("checking variable: ", feat))
+    
+      if (filter_AD) data <- data[!data$Dx=="AD", feat] 
+      
+      tmp <- data[, feat]
+    
+      tmp <- tmp[!is.na(tmp)]
+      freq = sum(tmp) / length(tmp) 
+      
+      if (freq >= 0.01 | is.nan(freq)) { 
+        feats_all_lowFreqExcl <- c(feats_all_lowFreqExcl, feat)
+      } 
+  }
+  
+  return(feats_all_lowFreqExcl)
+}
+
+feats_all_lowFreqExcl <- one_percent_rule(data=d, filter_AD=filter_one_percent, verbose=FALSE)
+
+feats_all_lowFreqExcl %>%  sort()
+
+```
+
+The following ones that should be excluded based on the 1% criteria:
+<br>
+Note: Some (or all) may already be excluded from list_frailty_indices.csv
+
+```{r}
+feats_excluded <- setdiff(feats_all_binarized, feats_all_lowFreqExcl)
+feats_excluded %>% sort()
+```
+
+
+And based on the 80% rule (i.e. less than 80% missing data), the following
+<br> 
+variables should be removed
+<br>
+Note: these will be auto-removed before computation of FI,
+<br>
+and is based on the total sample (including AD patients)
+
+```{r}
+
+feats_missing_rule <- c()
+
+for (feat in feats_all_binarized)
+{
+    
+  perc_missing <- mean(complete.cases(d[, feat]))
+  
+  if (perc_missing < 0.8){
+    feats_missing_rule <- c(feats_missing_rule, feat)
+  }
+  
+    
+}
+
+if(is.null(feats_missing_rule)){
+  print("No variables need removing based on the 80% rule")
+} else {
+  feats_missing_rule %>% sort()
+}
+
+
+```
+
+
+
+## Compute FI
+
+```{r compute_FI, include=F, eval = T}
+
+compute_FI <- function (feat)
+{
+    idx <- which(!is.na(feat))
+    
+    if ((length(idx) / length(feat))>0.2)
+    {
+        feat <- feat[idx]
+        FI = sum(feat) / length(feat)
+    } else {
+        FI = NA
+    }
+}
+
+# read in variable inclusion list
+
+
+d_FI <- read.csv2(paste0(wd, "/list_frailty_indices.csv"), header = T, sep = ",") #for now
+
+type_of_vars <- d_FI$type
+d_FI$type <- NULL
+
+
+```
+
+
+```{r, include=F, eval = T}
+
+if (ncol(d_FI) == 2){
+  count_incl_vars <- sum(d_FI[,2:ncol(d_FI)])
+  vars_count <- count_incl_vars
+} else {
+  count_incl_vars <- apply(d_FI[,2:ncol(d_FI)], 2, table)
+  vars_count <- count_incl_vars[2,]
+}
+
+
+```
+The number of included variables for each FI is:
+<br>
+`r names(d_FI)[2:ncol(d_FI)]`
+<br>
+`r vars_count`
+
+
+```{r, echo=FALSE}
+for (FI_list in 2:ncol(d_FI)){
+  FI_name <- names(d_FI)[FI_list]
+  tmp <- d_FI[,c("variable",FI_name)]
+  tmp <- tmp[tmp[,FI_name] == 1,]
+  print("-------------------")
+  print(paste0("The variables included for: ", FI_name, " are: "))
+  print("--------------------")
+  print(tmp$variable)
+  print("--------------------")
+  cat("\n\n\n\n\n")
+}
+```
+
+
+```{r compute_FI_cont, include=F, eval = T}
+names_FI <- names(d_FI)[grep("^FI_", names(d_FI))]
+names_FI <- names_FI[!names_FI %in% c("FI_all_cognitive", "FI_all_noncognitive")]
+
+# only keep those surviving the 1% threshold 
+d_FI = d_FI %>% filter(variable %in% feats_all_lowFreqExcl)
+
+for (FI in names_FI)
+{
+  d[,FI] <- NA
+  print(FI)
+  feats_FI <- as.character(d_FI[which(d_FI[, FI]==1), "variable"])
+  for (n in 1:nrow(d))
+  {
+      d[n, FI] <- compute_FI(d[n, feats_FI])
+  }
+}
+
+```
+
+## Inspect FI values
+
+```{r}
+
+d %>% dplyr::select(one_of(names_FI)) %>% 
+  melt() %>% 
+  ggplot(aes(value, color = variable, fill = variable, group = variable)) + geom_histogram()
+
+d %>% dplyr::select(one_of(names_FI)) %>% 
+  melt() %>% 
+  ggplot(aes(value, color = variable, group = variable)) + geom_density() + my_theme
+
+d %>% dplyr::select(one_of(names_FI)) %>% 
+  melt() %>% 
+  ggplot(aes(variable, value, color = variable, group = variable)) + geom_boxplot() + my_theme
+
+d %>% dplyr::select(one_of(names_FI)) %>% 
+  melt() %>% 
+  group_by(variable) %>% 
+  summarise(m = mean(value), sd = sd(value))
+```
+
+
+
+```{r, eval = T}
+if (ADNI_sample == "ADNI1"){
+  f_out <- file.path(out_dir, "d_all_FI.csv")
+} else if (ADNI_sample == "ADNI2 & ADNIGO"){
+  f_out <- file.path(out_dir, "ADNI2_ADNIGO_d_all_FI.csv")
+} else if (ADNI_sample %in% c("ADNI2", "ADNIGO")){
+  f_out <- file.path(out_dir, paste0(ADNI_sample, "_d_all_FI.csv"))
+}
+
+write.table(d, file = f_out, row.names = F, col.names = T, sep = ",", quote = F)
+
+```
+
+**The entire table, including FI, can be seen at**: 
+
+`r out_dir`
+
+```{r, eval=F}
+print(f_out)
+```
+
