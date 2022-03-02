@@ -6,10 +6,12 @@ based on data from the Alzheimer's Disease Neuroimaging Iniative (ADNI):
 <br>
 http://adni.loni.usc.edu/
 <br>
-These scripts have been run with R version 3.6.2 on Windows 11.
+To obtain access to data from ADNI, see this link:
+<br>
+http://adni.loni.usc.edu/data-samples/access-data/
 <br>
 <br>
-First, download the ADNIMERGE R-package (ADNIMERGE_0.0.1.tar.gz) from the following link:
+First,follow details of downloading download the ADNIMERGE R-package (ADNIMERGE_0.0.1.tar.gz) from the following link:
 <br>
 https://adni.bitbucket.io/
 <br>
@@ -19,16 +21,21 @@ Finally, to run all analyses, start the code in `run_scripts.R`.
 <br>
 This will run both `compute_FI.Rmd` and `refine_FI_analyse.Rmd`.
 <br>
-See below for some details of the scripts (and more in the actual scripts)
+See below for some details of the scripts (and more in the actual scripts).
 <br>
+Briefly, ADNI1 is used as the basis for refinement of any frailty index and the
 <br>
+main analyses, while ADNI2 combined with ADNIGO is used for validation.
+<br>
+These scripts have been run with R version 3.6.2 on Windows 11.
+
 ## Details of scripts
 <br>
-Note: HTML-reports will be generated in the working directory (i.e. repo location).
+Note: HTML-reports (one for each Rmarkdown file and "sample") will be generated in the working 
 <br>
-All other files will be outputed to subfolders `script_results/` and
+directory (i.e. repo location). All other files will be outputed to subfolders `script_results/`
 <br>
-`intermediate_files/` in current working directory (both modifiable to some extent)
+and `intermediate_files/` in current working directory (both modifiable to some extent)
 <br>
 <br>
 
@@ -49,29 +56,31 @@ based on different combinations of variables (if so, edit relevant line in `run_
 <br>
 This creates a csv-file that is used as input in `refine_FI_analyses.Rmd`, as well as an
 <br>
-HTML-report (in the workingd directory) that can be inspected for some summary reports.
+HTML-report (in the working directory) that can be inspected for some summary reports.
 <br>
 <br>
 **refine_FI_analyses.R**
 <br>
-Refines your chosen frailty index using dimensionality reduction (FAMD) and clustering (HCPC).
+Refines your chosen frailty index using dimensionality reduction (FAMD) and clustering (HCPC) for ADNI1.
 <br>
 Note that this will add a column with newly refined frailty index to *list_frailty_indices.csv*
 <br>
-Then, runs a set of analyses including binary classification and cox-regression (survival analyses).
+Then, runs a set of analyses including binary classification and cox-regression (survival analyses) for
 <br>
-An HTML-file is generated (in the working directory) containing detailed reports (and figures) of 
+both ADNI1 (main) as well as ADNI2 combined with ADNIGO (validation). An HTML-file is generated (in the 
 <br>
-various steps and analyses
+working directory) containing detailed reports (and figures) of various steps and analyses
 <br>
 <br>
 **run_scripts.R**
 <br>
-Has modifiable paramaters that affect mainly `refine_FI_analyses.Rmd`, including
+Has modifiable paramaters that affect mainly `refine_FI_analyses.Rmd`, including which sample to run the 
 <br>
-which sample to run the data with (i.e. ADNI1 and/or ADNI2 & ADNIGO), and what output to save.
+data with (i.e. ADNI1 and/or ADNI2 & ADNIGO), and what output to save. For the first run, ADNI1 must be used 
 <br>
-There is an internal logic of when to rerun the two Rmarkdown (.Rmd) scripts.
+to refine the FI, and build machine learning models that will be used in the validation analyes (ADNI2/ADNIGO). 
+<br>
+There is an internal logic of when  to rerun the two Rmarkdown (.Rmd) scripts.
 <br>
 <br>
 **additional_figures.R**
