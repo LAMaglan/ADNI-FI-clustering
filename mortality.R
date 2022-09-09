@@ -14,7 +14,7 @@ library(ADNIMERGE)
 ##read the ADNI dataset with the FI-variables, the recent adverse events log and the 
 # registry file.
 
-#Edit to name of csv-files (with .csv as suffix)
+#Edit to name of csv-file with the computed FI variables (with .csv as suffix)
 csv_file = ""
 dev_val_combine <- readr::read_csv(csv_file)
 recadv_tmp <- ADNIMERGE::recadv
