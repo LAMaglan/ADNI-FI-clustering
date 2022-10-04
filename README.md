@@ -88,3 +88,9 @@ There is an internal logic of when  to rerun the two Rmarkdown (.Rmd) scripts.
 Code to generate some of the figures. Need to add path to working directory (i.e. where the github
 <br>
 repo is cloned to). Takes an input csv-files from `refine_FI_analyses.Rmd`
+
+**mortality.R**
+<br>
+Code to run mortality analyses. Need to add path to working directory  (i.e. where csv-files from
+<br>
+`refine_FI_analyses.Rmd` are) and add name of said csv-file

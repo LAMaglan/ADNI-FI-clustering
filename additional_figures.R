@@ -73,13 +73,26 @@ val_all <- dplyr::rename(val_all, FIc = FI_Canevelli)
 #select MCI_subjects
 dev_all_mci <- dev_all %>% filter(Dx == "MCI")
 
-##rename Time and Conversion status variables for survival analysis 
+#select CN_subjects
+dev_all_hc <- dev_all %>% filter(Dx == "HC")
+
+
+##rename Time and Conversion status variables for survival analysis for MCI
 names(dev_all_mci)[names(dev_all_mci) == 'Coxreg_update_time_conversion'] <- 'Time'
 names(dev_all_mci)[names(dev_all_mci) == 'Coxreg_update_status'] <- 'Status'
 
 val_all_mci <- val_all %>% filter(Dx == "MCI")
 names(val_all_mci)[names(val_all_mci) == 'Coxreg_update_time_conversion'] <- 'Time'
 names(val_all_mci)[names(val_all_mci) == 'Coxreg_update_status'] <- 'Status'
+
+##rename Time and Conversion status variables for survival analysis for CN
+names(dev_all_hc)[names(dev_all_hc) == 'Coxreg_update_time_conversion'] <- 'Time'
+names(dev_all_hc)[names(dev_all_hc) == 'Coxreg_update_status'] <- 'Status'
+
+val_all_hc <- val_all %>% filter(Dx == "HC")
+names(val_all_hc)[names(val_all_hc) == 'Coxreg_update_time_conversion'] <- 'Time'
+names(val_all_hc)[names(val_all_hc) == 'Coxreg_update_status'] <- 'Status'
+
 
 ##create time variable in years
 
@@ -98,6 +111,16 @@ detach(dev_all_mci)
 attach(val_all_mci)
 val_all_mci_time_1plus <- val_all_mci[ which(Time >= 1),]
 detach(val_all_mci)
+
+##create variable with CN subjects with follow-up examinations only
+
+attach(dev_all_hc)
+dev_all_hc_time_1plus <- dev_all_hc[ which(Time >= 1),]
+detach(dev_all_hc)
+
+attach(val_all_hc)
+val_all_hc_time_1plus <- val_all_hc[ which(Time >= 1),]
+detach(val_all_hc)
 
 
 #FIG. 2A: Density plots showing three frailty index (FI) distributions for ADNI1 (development) and ADNI2/GO (validation) cohorts. FIs = A 93-item FI created according to standard procedure by the authors. FIr = A 26-item FI created by adding a data-driven supplement to the standard procedure. FIc = A 40-item FI created according to standard procedure by Canevelli, et al., (22)
@@ -250,7 +273,11 @@ ggplot(val_all, aes(x=reorder(Dx,FIc,na.rm=TRUE), y=FIc, fill=Dx))+
   labs(y="FIc",
        x="Diagnostic group (Dx)")
 
-# Fig 2C: show Kaplan-Meier survival curves for sample quartiles calculated for each FI. The survival probabilities indicate the probability of remaining stable MCI at time of follow-up, and vertical lines through each line indicate censoring. 
+######################
+# Fig 2C: show Kaplan-Meier survival curves for sample quartiles 
+# calculated for each FI. The survival probabilities indicate the 
+# probability of remaining stable MCI at time of follow-up, and 
+# vertical lines through each line indicate censoring. 
 
 ##quartiles
 
@@ -626,33 +653,33 @@ FIc_agescatter <- ggplot(val_all, aes(x=Age, y=FIc, color=Dx))+
   scale_color_brewer(palette="Accent")+
   labs(y="FI-value")
 
-#eFigure 6: AUC(t)-curves of FI performance in prediction of future dementia conversion in subjects with mild cognitive impairment at baseline 
+#Supplementary Fig. 5: AUC(t)-curves of FI performance in prediction of future dementia conversion in subjects with mild cognitive impairment at baseline 
 
 ##Development
 
-plotAUCcurve(ROC_dev_FIs_years, conf.int = FALSE, conf.band = TRUE, col="red4")
+plotAUCcurve(ROC_dev_FIs_years, conf.int = TRUE, conf.band = TRUE, col="red4")
 legend("topright",c("FIs"),col=c("red4"),lty=1,lwd=3)
 
-plotAUCcurve(ROC_dev_FIr_years, conf.int = FALSE, conf.band = TRUE, col="orange")
+plotAUCcurve(ROC_dev_FIr_years, conf.int = TRUE, conf.band = TRUE, col="orange")
 legend("topright",c("FIr"),col=c("orange"),lty=1,lwd=3)
 
-plotAUCcurve(ROC_dev_FIc_years, conf.int = FALSE, conf.band = TRUE, col="purple")
+plotAUCcurve(ROC_dev_FIc_years, conf.int = TRUE, conf.band = TRUE, col="purple")
 legend("topright",c("FIc"),col=c("purple"),lty=1,lwd=3)
 
 
 ##validation
 
-plotAUCcurve(ROC_val_FIs_years, conf.int = FALSE, conf.band = TRUE, col="red4")
+plotAUCcurve(ROC_val_FIs_years, conf.int = TRUE, conf.band = TRUE, col="red4")
 legend("topright",c("FIs"),col=c("red4"),lty=1,lwd=3)
 
 plotAUCcurve(ROC_val_FIr_years, conf.int = TRUE, conf.band = TRUE, col="orange")
 legend("topright",c("FIr"),col=c("orange"),lty=1,lwd=3)
 
-plotAUCcurve(ROC_val_FIc_years, conf.int = FALSE, conf.band = TRUE, col="purple")
+plotAUCcurve(ROC_val_FIc_years, conf.int = TRUE, conf.band = TRUE, col="purple")
 legend("topright",c("FIc"),col=c("purple"),lty=1,lwd=3)
 
 
-#eFigure 7 Differences in FI AUC(t) curves (TimeROC Fig 2D needs to be computed first)
+#Supplementary Fig. 6 Differences in FI AUC(t) curves (TimeROC Fig 2D needs to be computed first)
 
 ##Development 
 

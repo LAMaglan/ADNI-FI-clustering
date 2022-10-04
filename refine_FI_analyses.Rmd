@@ -1455,10 +1455,6 @@ res
 ```
 
 
-
-
-
-
 # Classification
 
 Classifying Dx (binary and multiclass classification)
@@ -1495,7 +1491,9 @@ run_cv_all <- function(data, Dx_groups = "HC and AD",  nfolds=10, nrep=100,
   data$Dx <- factor(data$Dx)
   
   metrics <- metric_set(accuracy, bal_accuracy, roc_auc,
-                        sens, spec, precision, recall)
+                        sens, spec, precision, recall,
+                        kap, mn_log_loss, mcc,
+                        f_meas, ppv, npv)
   
 
   
@@ -1588,7 +1586,7 @@ get_classification_metrics <- function(lda_model, feature="FI_standard_lda"){
     filter(wflow_id == feature) %>% 
     dplyr::select(-c(id2)) %>% 
     group_by(.metric, id) %>% 
-    summarise(rep_result = mean(.estimate)) %>% 
+    summarise(rep_result = mean(.estimate, na.rm = TRUE)) %>% 
     ungroup() %>% 
     group_by(.metric) %>% 
     summarise(SD = sd(rep_result, na.rm = TRUE))
@@ -1617,7 +1615,7 @@ get_classification_metrics <- function(lda_model, feature="FI_standard_lda"){
         filter(.metric == chosen_metric) %>% 
         dplyr::select(-c(id2)) %>% 
         group_by(id) %>% 
-        summarise(rep_result = mean(.estimate)) %>% 
+        summarise(rep_result = mean(.estimate, na.rm = TRUE)) %>% 
         ungroup() %>% 
         get_confidence_interval(level=0.95)
     }, 
@@ -1698,6 +1696,24 @@ stat_compare_auc <- function(lda_models, compare_Canevelli=FALSE){
 
 ## Binary Classification
 
+```{r, echo = FALSE}
+HC_and_AD_data <- data_all %>% 
+  filter(Dx != "MCI") 
+
+HC_and_AD_data$Dx <- factor(HC_and_AD_data$Dx)
+
+MCI_and_AD_data <- data_all %>% 
+  filter(Dx != "HC") 
+
+MCI_and_AD_data$Dx <- factor(MCI_and_AD_data$Dx)
+
+HC_and_MCI_data <- data_all %>% 
+  filter(Dx != "AD") 
+
+HC_and_MCI_data$Dx <- factor(HC_and_MCI_data$Dx)
+```
+
+
 ```{r save_bin_models, warning=FALSE, echo=FALSE, eval=only_for_ADNI1}
 lda_spec <- discrim_linear() %>%
   set_engine("mda")
@@ -1721,10 +1737,6 @@ if (include_Canevelli){
 
 
 ## HC and AD
-HC_and_AD_data <- data_all %>% 
-  filter(Dx != "MCI") 
-
-HC_and_AD_data$Dx <- factor(HC_and_AD_data$Dx)
 
 lda_orig_HC_and_AD <- 
   lda_orig_wf %>% 
@@ -1740,12 +1752,10 @@ if (include_Canevelli){
     lda_Canevelli_wf %>% 
     fit(data=HC_and_AD_data) 
 }
+
+
+
 ### MCI and AD
-MCI_and_AD_data <- data_all %>% 
-  filter(Dx != "HC") 
-
-MCI_and_AD_data$Dx <- factor(MCI_and_AD_data$Dx)
-
 
 lda_orig_MCI_and_AD <- 
   lda_orig_wf %>% 
@@ -1764,10 +1774,6 @@ if (include_Canevelli){
 }
 
 ## HC and MCI
-HC_and_MCI_data <- data_all %>% 
-  filter(Dx != "AD") 
-
-HC_and_MCI_data$Dx <- factor(HC_and_MCI_data$Dx)
 
 lda_orig_HC_and_MCI <-
   lda_orig_wf %>% 
@@ -1802,6 +1808,116 @@ if(include_Canevelli){
   saveRDS(lda_Canevelli_HC_and_MCI, file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_MCI.RDS"))
 }
 ```
+
+```{r, undersample_function, echo=FALSE}
+undersample_two_class_data <- function(orig_data, Dx_to_undersample, other_Dx, seed=546){
+  
+  Dx_to_undersample_ind <- which(orig_data$Dx == Dx_to_undersample)
+  other_Dx_ind <- which(orig_data$Dx == other_Dx)
+  
+  
+  undersample_amount = length(other_Dx_ind)
+  set.seed(seed)
+  undersampled_Dx_ind = sample(Dx_to_undersample_ind, undersample_amount)
+  
+  undersampled_data <- orig_data[c(undersampled_Dx_ind, other_Dx_ind), ]
+  
+  return(undersampled_data)
+  
+  
+}
+
+```
+
+```{r, do_undersampling, echo=FALSE, eval=only_for_ADNI1}
+HC_and_AD_balanced_data <- undersample_two_class_data(HC_and_AD_data, "HC", "AD")
+MCI_and_AD_balanced_data <- undersample_two_class_data(MCI_and_AD_data, "MCI", "AD")
+HC_and_MCI_balanced_data <- undersample_two_class_data(HC_and_MCI_data, "MCI", "HC")
+```
+
+
+```{r validation_cv_rep_funcs, echo=FALSE, eval=only_for_ADNI2}
+run_cv_validation <- function(lda_model, input_data,
+                              nreps=100, nfolds=10,
+                              Dx_groups,
+                              verbose=FALSE){
+  
+  if (verbose) print(paste0("------------running with ", nreps, "repetitions and ", nfolds, "folds-------------"))
+  
+  input_data$Dx <- factor(input_data$Dx)
+  rep_folds <- vfold_cv(input_data, v=nfolds, repeats=nreps, strata = Dx)
+  
+  
+  all_rep_res <- list()
+  
+  for(repetition in unique(rep_folds$id)){
+    
+    all_fold_res <- list()
+    
+    for(fold in unique(rep_folds$id2)){
+      current_split <- rep_folds[rep_folds$id==repetition & rep_folds$id2 == fold,]
+      test_ids <- setdiff(seq(1:nrow(input_data)), current_split$splits[[1]]$in_id)
+      
+      cv_rep_sample <- input_data[test_ids,]
+      
+      all_fold_res[[fold]] <- evaluate_ML_final(lda_model = lda_model,
+                                      FI_dataframe = cv_rep_sample,
+                                      Dx_groups = Dx_groups)
+      
+    }
+    
+    all_rep_tmp <- do.call(rbind, all_fold_res)
+    
+    all_rep_res[[repetition]] <- all_rep_tmp %>% 
+      group_by(.metric) %>% 
+      summarise(rep_res = mean(.estimate, na.rm=TRUE))
+    
+    
+  }
+  
+  all_rep_res = do.call(rbind, all_rep_res)
+  
+  
+  final_result <- all_rep_res %>% 
+    group_by(.metric) %>% 
+    summarise(final_rep_res = mean(rep_res, na.rm=TRUE), rep_res_sd = sd(rep_res, na.rm=TRUE))
+  
+  
+  return(final_result)
+}
+
+
+
+validation_ML_with_cv <- function(lda_model, input_data,
+                                         nreps=100, nfolds=10,
+                                  Dx_groups,
+                                         verbose=FALSE){
+
+  
+  validation_ML <- evaluate_ML_final(lda_model = lda_model, 
+                                     FI_dataframe = input_data,
+                                     Dx_groups = Dx_groups)
+  
+  validation_ML_cv_rep <- run_cv_validation(lda_model=lda_model, input_data=input_data,
+                                          nreps=nreps, nfolds=nfolds,
+                                          Dx_groups,
+                                          verbose=verbose)
+  
+  
+  validation_ML_res <- cbind(validation_ML, validation_ML_cv_rep$final_rep_res, validation_ML_cv_rep$rep_res_sd)
+  names(validation_ML_res) <- c(names(validation_ML), "rep_cv_mean", "rep_cv_sd")
+  validation_ML_res$nreps <- nreps
+  validation_ML_res$nfolds <- nfolds
+
+  
+  return(validation_ML_res)
+  
+  
+}
+
+
+```
+
 
 ```{r load_bin_models, echo=FALSE, eval=only_for_ADNI2}
 
@@ -1905,14 +2021,18 @@ if (save_ML_table){
 }
 ```
 
-```{r echo=FALSE, eval=only_for_ADNI2}
+```{r echo=FALSE, warning=FALSE, message=FALSE, eval=only_for_ADNI2}
 print("Results from classifying ADNI2/ADNIGO")
-HC_AD_standard_res <- evaluate_ML_final(lda_model = lda_orig_HC_and_AD, 
-                                        FI_dataframe = HC_and_AD_standard,
-                                        Dx_groups = "HC and AD")
+
+HC_AD_standard_res <- validation_ML_with_cv(lda_model = lda_orig_HC_and_AD,
+                                                   input_data = HC_and_AD_standard,
+
+                                                   Dx_groups= "HC and AD")
+
 knitr::kable(HC_AD_standard_res)
 
 ```
+
 ```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
 if (save_ML_table){
   HC_AD_res_flex <- df2flextable(as.data.frame(HC_AD_standard_res), digits=5)
@@ -1939,13 +2059,17 @@ if (save_ML_table){
 ```
 
 
-```{r echo=FALSE, eval=only_for_ADNI2}
+```{r echo=FALSE, warning=FALSE, message=FALSE, eval=only_for_ADNI2}
 print("Results from classifying ADNI2/ADNIGO")
-HC_AD_refined_res <- evaluate_ML_final(lda_model = lda_refined_HC_and_AD, 
-                                       FI_dataframe = HC_and_AD_refined,
-                                       Dx_groups = "HC and AD")
+
+
+HC_AD_refined_res <- validation_ML_with_cv(lda_model = lda_refined_HC_and_AD,
+                                                   input_data = HC_and_AD_refined,
+
+                                                   Dx_groups= "HC and AD")
 knitr::kable(HC_AD_refined_res)
 ```
+
 ```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
 if (save_ML_table){
   HC_AD_res_flex <- df2flextable(as.data.frame(HC_AD_refined_res), digits=5)
@@ -1975,11 +2099,13 @@ if (save_ML_table){
 }  
 ```
 
-```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+```{r echo=FALSE, warning=FALSE, message=FALSE, eval=only_for_ADNI2_Canevelli}
 print("Results from classifying ADNI2/ADNIGO")
-HC_AD_Canevelli_res <- evaluate_ML_final(lda_model = lda_Canevelli_HC_and_AD, 
-                                       FI_dataframe = HC_and_AD_Canevelli,
-                                       Dx_groups = "HC and AD")
+
+HC_AD_Canevelli_res <- validation_ML_with_cv(lda_model = lda_Canevelli_HC_and_AD,
+                                                   input_data = HC_and_AD_Canevelli,
+
+                                                   Dx_groups= "HC and AD")
 knitr::kable(HC_AD_Canevelli_res)
 
 ```
@@ -2057,11 +2183,12 @@ if (save_ML_table){
 ```
 
 
-```{r echo=FALSE, eval=only_for_ADNI2}
+```{r echo=FALSE, warning=FALSE, message=FALSE, eval=only_for_ADNI2}
 print("Results from classifying ADNI2/ADNIGO")
-MCI_AD_standard_res <- evaluate_ML_final(lda_model = lda_orig_MCI_and_AD, 
-                                         FI_dataframe = MCI_and_AD_standard,
-                                         Dx_groups = "MCI and AD")
+
+MCI_AD_standard_res <- validation_ML_with_cv(lda_model = lda_orig_MCI_and_AD,
+                                                   input_data = MCI_and_AD_standard,
+                                                   Dx_groups= "MCI and AD")
 knitr::kable(MCI_AD_standard_res)
 
 ```
@@ -2092,11 +2219,12 @@ if (save_ML_table){
 }  
 ```
 
-```{r echo=FALSE, eval=only_for_ADNI2}
+```{r echo=FALSE, warning=FALSE, message=FALSE, eval=only_for_ADNI2}
 print("Results from classifying ADNI2/ADNIGO")
-MCI_AD_refined_res <- evaluate_ML_final(lda_model = lda_refined_MCI_and_AD, 
-                                        FI_dataframe = MCI_and_AD_refined,
-                                        Dx_groups = "MCI and AD")
+MCI_AD_refined_res <- validation_ML_with_cv(lda_model = lda_refined_MCI_and_AD, 
+                                                   input_data = MCI_and_AD_refined,
+
+                                                   Dx_groups = "MCI and AD")
 knitr::kable(MCI_AD_refined_res)
 
 ```
@@ -2130,11 +2258,12 @@ if (save_ML_table){
 }  
 ```
 
-```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+```{r echo=FALSE, warning=FALSE, message=FALSE, eval=only_for_ADNI2_Canevelli}
 print("Results from classifying ADNI2/ADNIGO")
-MCI_AD_Canevelli_res <- evaluate_ML_final(lda_model = lda_Canevelli_MCI_and_AD, 
-                                         FI_dataframe = MCI_and_AD_Canevelli,
-                                         Dx_groups = "MCI and AD")
+
+MCI_AD_Canevelli_res <- validation_ML_with_cv(lda_model = lda_Canevelli_MCI_and_AD, 
+                                                   input_data = MCI_and_AD_Canevelli,
+Dx_groups = "MCI and AD")
 knitr::kable(MCI_AD_Canevelli_res)
 
 ```
@@ -2213,12 +2342,15 @@ if (save_ML_table){
 ```
 
 
-```{r echo=FALSE, eval=only_for_ADNI2}
+```{r echo=FALSE, warning=FALSE, message=FALSE, eval=only_for_ADNI2}
 print("Results from classifying ADNI2/ADNIGO")
 
-HC_MCI_standard_res <- evaluate_ML_final(lda_model = lda_orig_HC_and_MCI, 
-                                         FI_dataframe = HC_and_MCI_standard,
+
+HC_MCI_standard_res <- validation_ML_with_cv(lda_model = lda_orig_HC_and_MCI, 
+                                         input_data = HC_and_MCI_standard,
                                          Dx_groups = "HC and MCI")
+
+
 knitr::kable(HC_MCI_standard_res)
 
 
@@ -2253,11 +2385,11 @@ if (save_ML_table){
 }  
 ```
 
-```{r echo=FALSE, eval=only_for_ADNI2}
+```{r echo=FALSE, warning=FALSE, message=FALSE, eval=only_for_ADNI2}
 print("Results from classifying ADNI2/ADNIGO")
 
-HC_MCI_refined_res <- evaluate_ML_final(lda_model = lda_refined_HC_and_MCI, 
-                                        FI_dataframe = HC_and_MCI_refined,
+HC_MCI_refined_res <- validation_ML_with_cv(lda_model = lda_refined_HC_and_MCI, 
+                                        input_data = HC_and_MCI_refined,
                                         Dx_groups = "HC and MCI")
 
 knitr::kable(HC_MCI_refined_res)
@@ -2294,14 +2426,17 @@ if (save_ML_table){
 }  
 ```
 
-```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+```{r echo=FALSE, warning=FALSE, message=FALSE, eval=only_for_ADNI2_Canevelli}
 print("Results from classifying ADNI2/ADNIGO")
-HC_MCI_Canevelli_res <- evaluate_ML_final(lda_model = lda_Canevelli_HC_and_MCI, 
-                                         FI_dataframe = HC_and_MCI_Canevelli,
+
+
+HC_MCI_Canevelli_res <- validation_ML_with_cv(lda_model = lda_Canevelli_HC_and_MCI, 
+                                         input_data = HC_and_MCI_Canevelli,
                                          Dx_groups = "HC and MCI")
 knitr::kable(HC_MCI_Canevelli_res)
 
 ```
+
 ```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2_Canevelli}
 
 if (save_ML_table){
@@ -3247,4 +3382,1249 @@ compare.jaccard(res.hcpc$data.clust$clust, hcpc_60$data.clust$clust)
 ```{r, echo=FALSE, eval=only_for_ADNI1}
 print("Compared to all components used in clustering\n")
 compare.jaccard(res.hcpc$data.clust$clust, hcpc_all$data.clust$clust)
+```
+
+
+
+
+
+# Reviewer concern 1: balanced sampling in classification
+
+```{r run_bin_cv_balanced, echo=FALSE, warning=FALSE, message=FALSE, eval=only_for_ADNI1}
+HC_AD_lda_balanced <- run_cv_all(HC_and_AD_balanced_data, Dx_groups = "HC and AD",  nfolds=nfolds, nrep=nrep,
+                        include_Canevelli = include_Canevelli,
+                        seed=123, verbose=FALSE)
+
+MCI_AD_lda_balanced <- run_cv_all(MCI_and_AD_balanced_data, Dx_groups = "MCI and AD",  nfolds=nfolds, nrep=nrep,
+                         include_Canevelli = include_Canevelli,
+                         seed=123, verbose=FALSE)
+
+HC_MCI_lda_balanced <- run_cv_all(HC_and_MCI_balanced_data, Dx_groups = "HC and MCI",  nfolds=nfolds, nrep=nrep,
+                         include_Canevelli = include_Canevelli,
+                         seed=123, verbose=FALSE)
+
+```
+
+
+
+
+### HC vs AD (balanced)
+
+
+#### Standard FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results with balaned sampling (ADNI1)")
+HC_AD_cv_standard_balanced_res <- get_classification_metrics(HC_AD_lda_balanced, feature="FI_standard_lda") 
+knitr::kable(HC_AD_cv_standard_balanced_res)
+
+```
+```{r, echo=FALSE, results='hide', message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_flex_balanced <- df2flextable(as.data.frame(HC_AD_cv_standard_balanced_res), digits=5)
+  table2docx(HC_AD_cv_res_flex_balanced, title = "Classification (balanced sampling): HC vs AD using standard FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_standard_balanced_FI"))
+}
+```
+
+
+
+#### Refined FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results with balaned sampling (ADNI1)")
+HC_AD_cv_refined_balanced_res  <- get_classification_metrics(HC_AD_lda_balanced, feature="FI_refined_lda")
+knitr::kable(HC_AD_cv_refined_balanced_res)
+
+```
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_flex_balanced <- df2flextable(as.data.frame(HC_AD_cv_refined_balanced_res), digits=5)
+  table2docx(HC_AD_cv_res_flex_balanced, title = "Classification (balanced sampling): HC vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_refined_balanced_FI"))
+}  
+```
+
+
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results with balaned sampling (ADNI1)")
+HC_AD_cv_Canevelli_balanced_res  <- get_classification_metrics(HC_AD_lda_balanced, feature="FI_Canevelli_lda")
+knitr::kable(HC_AD_cv_Canevelli_balanced_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+if (save_ML_table){
+  HC_AD_cv_res_flex_balanced <- df2flextable(as.data.frame(HC_AD_cv_Canevelli_balanced_res), digits=5)
+  table2docx(HC_AD_cv_res_flex_balanced, title = "Classification (balanced sampling): HC vs AD using Canevelli FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_Canevelli_refined_FI"))
+}  
+```
+
+
+
+
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("##### Statistical comparison (t-test) of AUC  (balanced sampling)\\n")
+
+```
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1}
+print("HC vs. AD (balanced sampling): Statistical comparison (t-test) of AUC (standard vs refined FI)")
+
+HC_AD_lda_balanced_stats <- stat_compare_auc(HC_AD_lda_balanced)
+HC_AD_lda_balanced_stats
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, warning=FALSE, eval=only_for_ADNI1}
+
+if (save_ML_table){
+  HC_AD_lda_balanced_stats_flex <- df2flextable(HC_AD_lda_balanced_stats, digits=5)
+  table2docx(HC_AD_lda_balanced_stats_flex, 
+             title = "HC vs. AD (balanced sampling): Statistical comparison (t-test) of AUC (standard vs refined FI)", 
+             target = paste0(results_dir, "/", chosen_FI_refined, 
+                             "/ADNI1_HC_vs_AD_balanced_classification_stats"))
+}  
+```
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1_Canevelli}
+print("HC vs. AD (balanced sampling): Statistical comparison (t-test) of AUC (Canevelli vs refined FI)")
+
+HC_AD_lda_balanced_stats <- stat_compare_auc(HC_AD_lda_balanced, compare_Canevelli = TRUE)
+HC_AD_lda_balanced_stats
+
+```
+```{r, echo=FALSE, warning=FALSE, results="hide", message=FALSE,  eval=only_for_ADNI1_Canevelli}
+
+if (save_ML_table){
+  HC_AD_lda_balanced_stats_flex <- df2flextable(HC_AD_lda_balanced_stats, digits=5)
+  table2docx(HC_AD_lda_balanced_stats_flex, 
+             title = "HC vs. AD (balanced sampling): Statistical comparison (t-test) of AUC (standard vs refined FI)", 
+             target = paste0(results_dir, "/", chosen_FI_refined, 
+                             "/ADNI1_HC_vs_AD_balanced_classification_stats_Canevelli"))
+}  
+```
+
+
+
+
+
+### MCI vs AD
+
+
+#### Standard FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results with balaned sampling (ADNI1)")
+MCI_AD_cv_standard_balanced_res <- get_classification_metrics(MCI_AD_lda_balanced, feature="FI_standard_lda")
+knitr::kable(MCI_AD_cv_standard_balanced_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  MCI_AD_cv_res_flex_balanced <- df2flextable(as.data.frame(MCI_AD_cv_standard_balanced_res), digits=5)
+  table2docx(MCI_AD_cv_res_flex_balanced, title = "Classification (balanced sampling): MCI vs AD using standard FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_MCI_AD_cv_standard_balanced_FI"))
+}
+```
+
+
+
+#### Refined FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results with balaned sampling (ADNI1)")
+MCI_AD_cv_refined_balanced_res <- get_classification_metrics(MCI_AD_lda_balanced, feature="FI_refined_lda")
+knitr::kable(MCI_AD_cv_refined_balanced_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  MCI_AD_cv_res_flex_balanced <- df2flextable(as.data.frame(MCI_AD_cv_refined_balanced_res), digits=5)
+  table2docx(MCI_AD_cv_res_flex_balanced, title = "Classification (balanced sampling): MCI vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_MCI_AD_cv_refined_balanced_FI"))
+}  
+```
+
+
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results with balaned sampling (ADNI1)")
+MCI_AD_cv_Canevelli_balanced_res  <- get_classification_metrics(MCI_AD_lda_balanced, feature="FI_Canevelli_lda")
+knitr::kable(MCI_AD_cv_Canevelli_balanced_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+if (save_ML_table){
+  MCI_AD_cv_res_flex_balanced <- df2flextable(as.data.frame(MCI_AD_cv_Canevelli_balanced_res), digits=5)
+  table2docx(MCI_AD_cv_res_flex_balanced, title = "Classification (balanced sampling): MCI vs AD using Canevelli FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_MCI_AD_cv_Canevelli_refined_FI"))
+}  
+```
+
+
+
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("##### Statistical comparison (t-test) of AUC  (balanced sampling)\\n")
+
+```
+
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1}
+print("MCI vs. AD (balanced sampling): Statistical comparison (t-test) of AUC (standard vs refined FI)")
+
+MCI_AD_lda_balanced_stats <- stat_compare_auc(MCI_AD_lda_balanced)
+MCI_AD_lda_balanced_stats
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, warning=FALSE, eval=only_for_ADNI1}
+
+if (save_ML_table){
+  MCI_AD_lda_balanced_stats_flex <- df2flextable(MCI_AD_lda_balanced_stats, digits=5)
+  table2docx(MCI_AD_lda_balanced_stats_flex, 
+             title = "MCI vs. AD (balanced sampling): Statistical comparison (t-test) of AUC (standard vs refined FI)", 
+             target = paste0(results_dir, "/", chosen_FI_refined, 
+                             "/ADNI1_MCI_vs_AD_balanced_classification_stats"))
+}  
+```
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1_Canevelli}
+print("MCI vs. AD (balanced sampling): Statistical comparison (t-test) of AUC (Canevelli vs refined FI)")
+
+MCI_AD_lda_balanced_stats <- stat_compare_auc(MCI_AD_lda_balanced, compare_Canevelli = TRUE)
+MCI_AD_lda_balanced_stats
+
+```
+```{r, echo=FALSE, warning=FALSE, results="hide", message=FALSE,  eval=only_for_ADNI1_Canevelli}
+
+if (save_ML_table){
+  MCI_AD_lda_balanced_stats_flex <- df2flextable(MCI_AD_lda_balanced_stats, digits=5)
+  table2docx(MCI_AD_lda_balanced_stats_flex, 
+             title = "MCI vs. AD (balanced sampling): Statistical comparison (t-test) of AUC (standard vs refined FI)", 
+             target = paste0(results_dir, "/", chosen_FI_refined, 
+                             "/ADNI1_MCI_vs_AD_balanced_classification_stats_Canevelli"))
+}  
+```
+
+### HC vs MCI
+
+
+#### Standard FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results with balaned sampling (ADNI1)")
+HC_MCI_cv_standard_balanced_res <- get_classification_metrics(HC_MCI_lda_balanced, feature="FI_standard_lda")
+knitr::kable(HC_MCI_cv_standard_balanced_res)
+
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+
+if (save_ML_table){
+  HC_MCI_cv_res_flex_balanced <- df2flextable(as.data.frame(HC_MCI_cv_standard_balanced_res), digits=5)
+  table2docx(HC_MCI_cv_res_flex_balanced, title = "Classification (balanced sampling): HC vs MCI using standard FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_MCI_cv_standard_balanced_FI"))
+}  
+```
+
+
+#### Refined FI
+
+```{r, echo = FALSE, eval=only_for_ADNI1}
+print("Cross-validated results with balaned sampling (ADNI1)")
+HC_MCI_cv_refined_balanced_res <- get_classification_metrics(HC_MCI_lda_balanced, feature="FI_refined_lda")
+knitr::kable(HC_MCI_cv_refined_balanced_res)
+
+
+```
+
+```{r, echo = FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+
+if (save_ML_table){
+  HC_MCI_cv_res_flex_balanced <- df2flextable(as.data.frame(HC_MCI_cv_refined_balanced_res), digits=5)
+  table2docx(HC_MCI_cv_res_flex_balanced, title = "Classification (balanced sampling): HC vs MCI using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_MCI_cv_refined_balanced_FI"))
+}  
+```
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results with balaned sampling (ADNI1)")
+HC_MCI_cv_Canevelli_balanced_res  <- get_classification_metrics(HC_MCI_lda_balanced, feature="FI_Canevelli_lda")
+knitr::kable(HC_MCI_cv_Canevelli_balanced_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+
+if (save_ML_table){
+  HC_MCI_cv_res_flex_balanced <- df2flextable(as.data.frame(HC_MCI_cv_Canevelli_balanced_res), digits=5)
+  table2docx(HC_MCI_cv_res_flex_balanced, title = "Classification (balanced sampling): HC vs MCI using Canevelli FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_MCI_cv_Canevelli_refined_FI"))
+}  
+```
+
+
+
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1}
+knitr::asis_output("##### Statistical comparison (t-test) of AUC  (balanced sampling)\\n")
+
+```
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1}
+print("HC vs. MCI (balanced sampling): Statistical comparison (t-test) of AUC (standard vs refined FI)")
+
+HC_MCI_lda_balanced_stats <- stat_compare_auc(HC_MCI_lda_balanced)
+HC_MCI_lda_balanced_stats
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, warning=FALSE, eval=only_for_ADNI1}
+
+if (save_ML_table){
+  HC_MCI_lda_balanced_stats_flex <- df2flextable(HC_MCI_lda_balanced_stats, digits=5)
+  table2docx(HC_MCI_lda_balanced_stats_flex, 
+             title = "HC vs. MCI (balanced sampling): Statistical comparison (t-test) of AUC (standard vs refined FI)", 
+             target = paste0(results_dir, "/", chosen_FI_refined, 
+                             "/ADNI1_HC_vs_MCI_balanced_classification_stats"))
+}  
+```
+
+```{r, echo=FALSE, warning=FALSE, eval=only_for_ADNI1_Canevelli}
+print("HC vs. MCI (balanced sampling): Statistical comparison (t-test) of AUC (Canevelli vs refined FI)")
+
+HC_MCI_lda_balanced_stats <- stat_compare_auc(HC_MCI_lda_balanced, compare_Canevelli = TRUE)
+HC_MCI_lda_balanced_stats
+
+```
+```{r, echo=FALSE, warning=FALSE, results="hide", message=FALSE,  eval=only_for_ADNI1_Canevelli}
+
+if (save_ML_table){
+  HC_MCI_lda_balanced_stats_flex <- df2flextable(HC_MCI_lda_balanced_stats, digits=5)
+  table2docx(HC_MCI_lda_balanced_stats_flex, 
+             title = "HC vs. MCI (balanced sampling): Statistical comparison (t-test) of AUC (standard vs refined FI)", 
+             target = paste0(results_dir, "/", chosen_FI_refined, 
+                             "/ADNI1_HC_vs_MCI_balanced_classification_stats_Canevelli"))
+}  
+```
+
+# Reviewer concern 4: discriminative ability of FI as a function of age and sex
+
+
+four new models for classifying HC vs AD based on age and sex groupings:
+<br>
+1) young (age < 75) males
+<br>
+2) old (age >= 75) males
+<br>
+3) young (age < 75) females
+<br>
+4) old (age >= 75) females
+
+```{r, age_sex_split_function, echo=FALSE}
+age_sex_split <- function(data, sex="Male", age="old"){
+  
+  if (age=="old"){
+    age_sex_data <- data %>% 
+      filter(Age >= 75)
+  } else {
+    age_sex_data <- data %>% 
+      filter(Age < 75)
+  }
+  
+  age_sex_data <- age_sex_data %>% 
+    filter(Sex == sex)
+  
+  
+  age_sex_data$Sex <- as.factor(age_sex_data$Sex)
+    
+  
+  return(age_sex_data)
+  
+  
+}
+
+```
+
+```{r, echo = FALSE}
+HC_and_AD_male_young <- age_sex_split(data=HC_and_AD_data, sex = "Male", age = "young")
+HC_and_AD_male_old <- age_sex_split(data=HC_and_AD_data, sex = "Male", age = "old")
+HC_and_AD_female_young <- age_sex_split(data=HC_and_AD_data, sex = "Female", age = "young")
+HC_and_AD_female_old <- age_sex_split(data=HC_and_AD_data, sex = "Female", age = "old")
+```
+
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+
+
+lda_orig_HC_and_AD_male_young <- 
+  lda_orig_wf %>% 
+  fit(data=HC_and_AD_male_young) 
+
+lda_orig_HC_and_AD_male_old <- 
+  lda_orig_wf %>% 
+  fit(data=HC_and_AD_male_old) 
+
+lda_orig_HC_and_AD_female_young <- 
+  lda_orig_wf %>% 
+  fit(data=HC_and_AD_female_young) 
+
+lda_orig_HC_and_AD_female_old <- 
+  lda_orig_wf %>% 
+  fit(data=HC_and_AD_female_old) 
+
+
+lda_refined_HC_and_AD_male_young <- 
+  lda_refined_wf %>% 
+  fit(data=HC_and_AD_male_young) 
+
+lda_refined_HC_and_AD_male_old <- 
+  lda_refined_wf %>% 
+  fit(data=HC_and_AD_male_old) 
+
+lda_refined_HC_and_AD_female_young <- 
+  lda_refined_wf %>% 
+  fit(data=HC_and_AD_female_young) 
+
+lda_refined_HC_and_AD_female_old <- 
+  lda_refined_wf %>% 
+  fit(data=HC_and_AD_female_old) 
+
+
+
+if (include_Canevelli){
+  
+  lda_Canevelli_HC_and_AD_male_young <- 
+    lda_Canevelli_wf %>% 
+    fit(data=HC_and_AD_male_young) 
+  
+  lda_Canevelli_HC_and_AD_male_old <- 
+    lda_Canevelli_wf %>% 
+    fit(data=HC_and_AD_male_old) 
+  
+  lda_Canevelli_HC_and_AD_female_young <- 
+    lda_Canevelli_wf %>% 
+    fit(data=HC_and_AD_female_young) 
+  
+  lda_Canevelli_HC_and_AD_female_old <- 
+    lda_Canevelli_wf %>% 
+    fit(data=HC_and_AD_female_old) 
+
+}
+
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+saveRDS(lda_orig_HC_and_AD_male_young, file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_AD_male_young.RDS"))
+saveRDS(lda_orig_HC_and_AD_male_old, file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_AD_male_old.RDS"))
+saveRDS(lda_orig_HC_and_AD_female_young, file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_AD_female_young.RDS"))
+saveRDS(lda_orig_HC_and_AD_female_young, file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_AD_female_old.RDS"))
+
+
+saveRDS(lda_refined_HC_and_AD_male_young, file=file.path(wd, "intermediate_files/ML_models/lda_refined_HC_and_AD_male_young.RDS"))
+saveRDS(lda_refined_HC_and_AD_male_old, file=file.path(wd, "intermediate_files/ML_models/lda_refined_HC_and_AD_male_old.RDS"))
+saveRDS(lda_refined_HC_and_AD_female_young, file=file.path(wd, "intermediate_files/ML_models/lda_refined_HC_and_AD_female_young.RDS"))
+saveRDS(lda_refined_HC_and_AD_female_young, file=file.path(wd, "intermediate_files/ML_models/lda_refined_HC_and_AD_female_old.RDS"))
+
+
+
+
+if(include_Canevelli){
+  saveRDS(lda_Canevelli_HC_and_AD_male_young, file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_AD_male_young.RDS"))
+  saveRDS(lda_Canevelli_HC_and_AD_male_old, file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_AD_male_old.RDS"))
+  saveRDS(lda_Canevelli_HC_and_AD_female_young, file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_AD_female_young.RDS"))
+  saveRDS(lda_Canevelli_HC_and_AD_female_young, file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_AD_female_old.RDS"))
+}
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI2}
+
+
+lda_orig_HC_and_AD_male_young <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_AD_male_young.RDS"))
+lda_orig_HC_and_AD_male_old <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_AD_male_old.RDS"))
+lda_orig_HC_and_AD_female_young <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_AD_female_young.RDS"))
+lda_orig_HC_and_AD_female_old <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_orig_HC_and_AD_female_old.RDS"))
+
+
+lda_refined_HC_and_AD_male_young <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_refined_HC_and_AD_male_young.RDS"))
+lda_refined_HC_and_AD_male_old <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_refined_HC_and_AD_male_old.RDS"))
+lda_refined_HC_and_AD_female_young <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_refined_HC_and_AD_female_young.RDS"))
+lda_refined_HC_and_AD_female_old <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_refined_HC_and_AD_female_old.RDS"))
+
+
+if(include_Canevelli){
+    lda_Canevelli_HC_and_AD_male_young <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_AD_male_young.RDS"))
+    lda_Canevelli_HC_and_AD_male_old <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_AD_male_old.RDS"))
+    lda_Canevelli_HC_and_AD_female_young <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_AD_female_young.RDS"))
+    lda_Canevelli_HC_and_AD_female_old <- readRDS(file=file.path(wd, "intermediate_files/ML_models/lda_Canevelli_HC_and_AD_female_old.RDS"))
+}
+
+```
+
+```{r, run_age_sex_models, echo=FALSE, eval=only_for_ADNI1}
+HC_AD_lda_male_young <- run_cv_all(HC_and_AD_male_young, Dx_groups = "HC and AD",  
+                                   nfolds=nfolds, nrep=nrep,
+                                   include_Canevelli = include_Canevelli,
+                                   seed=123, verbose=FALSE)
+
+HC_AD_lda_male_old <- run_cv_all(HC_and_AD_male_old, Dx_groups = "HC and AD",  
+                                   nfolds=nfolds, nrep=nrep,
+                                   include_Canevelli = include_Canevelli,
+                                   seed=123, verbose=FALSE)
+
+HC_AD_lda_female_young <- run_cv_all(HC_and_AD_female_young, Dx_groups = "HC and AD",  
+                                   nfolds=nfolds, nrep=nrep,
+                                   include_Canevelli = include_Canevelli,
+                                   seed=123, verbose=FALSE)
+
+HC_AD_lda_female_old <- run_cv_all(HC_and_AD_female_old, Dx_groups = "HC and AD",  
+                                   nfolds=nfolds, nrep=nrep,
+                                   include_Canevelli = include_Canevelli,
+                                   seed=123, verbose=FALSE)
+```
+
+
+
+
+
+## "young" males
+
+### HC vs AD
+
+
+#### Standard FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_standard_male_young_res <- get_classification_metrics(HC_AD_lda_male_young, feature="FI_standard_lda") 
+knitr::kable(HC_AD_cv_standard_male_young_res)
+
+```
+
+```{r, echo=FALSE, results='hide', message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_male_young_flex <- df2flextable(as.data.frame(HC_AD_cv_standard_male_young_res), digits=5)
+  table2docx(HC_AD_cv_res_male_young_flex, title = "Classification: HC vs AD using standard FI ('young' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_standard_FI_young_males"))
+}
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_standard_male_young_res <- validation_ML_with_cv(lda_model = lda_orig_HC_and_AD_male_young,
+                                                   input_data = HC_and_AD_male_young,
+
+                                                   Dx_groups= "HC and AD")
+
+knitr::kable(HC_AD_standard_male_young_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_male_young_flex <- df2flextable(as.data.frame(HC_AD_standard_male_young_res), digits=5)
+  table2docx(HC_AD_res_male_young_flex, title = "Classification: HC vs AD using standard FI ('young' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_standard_FI_young_males"))
+}
+
+```
+
+#### Refined FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_refined_male_young_res  <- get_classification_metrics(HC_AD_lda_male_young, feature="FI_refined_lda")
+knitr::kable(HC_AD_cv_refined_male_young_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_male_young_flex <- df2flextable(as.data.frame(HC_AD_cv_refined_male_young_res), digits=5)
+  table2docx(HC_AD_cv_res_male_young_flex, title = "Classification: HC vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_refined_FI_young_males"))
+}  
+```
+
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+
+HC_AD_refined_male_young_res <- validation_ML_with_cv(lda_model = lda_refined_HC_and_AD,
+                                                   input_data = HC_and_AD_refined,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_refined_male_young_res)
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_male_young_flex <- df2flextable(as.data.frame(HC_AD_refined_male_young_res), digits=5)
+  table2docx(HC_AD_res_male_young_flex, title = "Classification: HC vs AD using refined FI ('young' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_refined_FI_young_males"))
+}
+
+```
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_Canevelli_male_young_res  <- get_classification_metrics(HC_AD_lda_male_young, feature="FI_Canevelli_lda")
+knitr::kable(HC_AD_cv_Canevelli_male_young_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+if (save_ML_table){
+  HC_AD_cv_res_male_young_flex <- df2flextable(as.data.frame(HC_AD_cv_Canevelli_male_young_res), digits=5)
+  table2docx(HC_AD_cv_res_male_young_flex, title = "Classification: HC vs AD using Canevelli FI ('young' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_Canevelli_FI_young_males"))
+}  
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_Canevelli_male_young_res <- validation_ML_with_cv(lda_model = lda_Canevelli_HC_and_AD,
+                                                   input_data = HC_and_AD_Canevelli,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_Canevelli_male_young_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2_Canevelli}
+
+if (save_ML_table){
+  HC_AD_res_male_young_flex <- df2flextable(as.data.frame(HC_AD_Canevelli_male_young_res), digits=5)
+  table2docx(HC_AD_res_male_young_flex, title = "Classification: HC vs AD using Canevelli FI ('young' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_Canevelli_FI_young_males"))
+}
+```
+
+
+## "old" males
+
+### HC vs AD
+
+
+#### Standard FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_standard_male_old_res <- get_classification_metrics(HC_AD_lda_male_old, feature="FI_standard_lda") 
+knitr::kable(HC_AD_cv_standard_male_old_res)
+
+```
+
+```{r, echo=FALSE, results='hide', message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_male_old_flex <- df2flextable(as.data.frame(HC_AD_cv_standard_male_old_res), digits=5)
+  table2docx(HC_AD_cv_res_male_old_flex, title = "Classification: HC vs AD using standard FI ('old' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_standard_FI_old_males"))
+}
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_standard_male_old_res <- validation_ML_with_cv(lda_model = lda_orig_HC_and_AD_male_old,
+                                                   input_data = HC_and_AD_male_old,
+
+                                                   Dx_groups= "HC and AD")
+
+knitr::kable(HC_AD_standard_male_old_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_male_old_flex <- df2flextable(as.data.frame(HC_AD_standard_male_old_res), digits=5)
+  table2docx(HC_AD_res_male_old_flex, title = "Classification: HC vs AD using standard FI ('old' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_standard_FI_old_males"))
+}
+
+```
+
+#### Refined FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_refined_male_old_res  <- get_classification_metrics(HC_AD_lda_male_old, feature="FI_refined_lda")
+knitr::kable(HC_AD_cv_refined_male_old_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_male_old_flex <- df2flextable(as.data.frame(HC_AD_cv_refined_male_old_res), digits=5)
+  table2docx(HC_AD_cv_res_male_old_flex, title = "Classification: HC vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_refined_FI_old_males"))
+}  
+```
+
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+
+HC_AD_refined_male_old_res <- validation_ML_with_cv(lda_model = lda_refined_HC_and_AD,
+                                                   input_data = HC_and_AD_refined,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_refined_male_old_res)
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_male_old_flex <- df2flextable(as.data.frame(HC_AD_refined_male_old_res), digits=5)
+  table2docx(HC_AD_res_male_old_flex, title = "Classification: HC vs AD using refined FI ('old' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_refined_FI_old_males"))
+}
+
+```
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_Canevelli_male_old_res  <- get_classification_metrics(HC_AD_lda_male_old, feature="FI_Canevelli_lda")
+knitr::kable(HC_AD_cv_Canevelli_male_old_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+if (save_ML_table){
+  HC_AD_cv_res_male_old_flex <- df2flextable(as.data.frame(HC_AD_cv_Canevelli_male_old_res), digits=5)
+  table2docx(HC_AD_cv_res_male_old_flex, title = "Classification: HC vs AD using Canevelli FI ('old' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_Canevelli_FI_old_males"))
+}  
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_Canevelli_male_old_res <- validation_ML_with_cv(lda_model = lda_Canevelli_HC_and_AD,
+                                                   input_data = HC_and_AD_Canevelli,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_Canevelli_male_old_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2_Canevelli}
+
+if (save_ML_table){
+  HC_AD_res_male_old_flex <- df2flextable(as.data.frame(HC_AD_Canevelli_male_old_res), digits=5)
+  table2docx(HC_AD_res_male_old_flex, title = "Classification: HC vs AD using Canevelli FI ('old' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_Canevelli_FI_old_males"))
+}
+```
+
+
+## "young" females
+
+### HC vs AD
+
+
+#### Standard FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_standard_female_young_res <- get_classification_metrics(HC_AD_lda_female_young, feature="FI_standard_lda") 
+knitr::kable(HC_AD_cv_standard_female_young_res)
+
+```
+
+```{r, echo=FALSE, results='hide', message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_cv_standard_female_young_res), digits=5)
+  table2docx(HC_AD_cv_res_female_young_flex, title = "Classification: HC vs AD using standard FI ('young' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_standard_FI_young_females"))
+}
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_standard_female_young_res <- validation_ML_with_cv(lda_model = lda_orig_HC_and_AD_female_young,
+                                                   input_data = HC_and_AD_female_young,
+
+                                                   Dx_groups= "HC and AD")
+
+knitr::kable(HC_AD_standard_female_young_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_standard_female_young_res), digits=5)
+  table2docx(HC_AD_res_female_young_flex, title = "Classification: HC vs AD using standard FI ('young' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_standard_FI_young_females"))
+}
+
+```
+
+#### Refined FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_refined_female_young_res  <- get_classification_metrics(HC_AD_lda_female_young, feature="FI_refined_lda")
+knitr::kable(HC_AD_cv_refined_female_young_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_cv_refined_female_young_res), digits=5)
+  table2docx(HC_AD_cv_res_female_young_flex, title = "Classification: HC vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_refined_FI_young_females"))
+}  
+```
+
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+
+HC_AD_refined_female_young_res <- validation_ML_with_cv(lda_model = lda_refined_HC_and_AD,
+                                                   input_data = HC_and_AD_refined,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_refined_female_young_res)
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_refined_female_young_res), digits=5)
+  table2docx(HC_AD_res_female_young_flex, title = "Classification: HC vs AD using refined FI ('young' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_refined_FI_young_females"))
+}
+
+```
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_Canevelli_female_young_res  <- get_classification_metrics(HC_AD_lda_female_young, feature="FI_Canevelli_lda")
+knitr::kable(HC_AD_cv_Canevelli_female_young_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+if (save_ML_table){
+  HC_AD_cv_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_cv_Canevelli_female_young_res), digits=5)
+  table2docx(HC_AD_cv_res_female_young_flex, title = "Classification: HC vs AD using Canevelli FI ('young' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_Canevelli_FI_young_females"))
+}  
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_Canevelli_female_young_res <- validation_ML_with_cv(lda_model = lda_Canevelli_HC_and_AD,
+                                                   input_data = HC_and_AD_Canevelli,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_Canevelli_female_young_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2_Canevelli}
+
+if (save_ML_table){
+  HC_AD_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_Canevelli_female_young_res), digits=5)
+  table2docx(HC_AD_res_female_young_flex, title = "Classification: HC vs AD using Canevelli FI ('young' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_Canevelli_FI_young_females"))
+}
+```
+
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_male_old_flex <- df2flextable(as.data.frame(HC_AD_cv_refined_male_old_res), digits=5)
+  table2docx(HC_AD_cv_res_male_old_flex, title = "Classification: HC vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_refined_FI_old_males"))
+}  
+```
+
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+
+HC_AD_refined_male_old_res <- validation_ML_with_cv(lda_model = lda_refined_HC_and_AD,
+                                                   input_data = HC_and_AD_refined,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_refined_male_old_res)
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_male_old_flex <- df2flextable(as.data.frame(HC_AD_refined_male_old_res), digits=5)
+  table2docx(HC_AD_res_male_old_flex, title = "Classification: HC vs AD using refined FI ('old' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_refined_FI_old_males"))
+}
+
+```
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_Canevelli_male_old_res  <- get_classification_metrics(HC_AD_lda_male_old, feature="FI_Canevelli_lda")
+knitr::kable(HC_AD_cv_Canevelli_male_old_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+if (save_ML_table){
+  HC_AD_cv_res_male_old_flex <- df2flextable(as.data.frame(HC_AD_cv_Canevelli_male_old_res), digits=5)
+  table2docx(HC_AD_cv_res_male_old_flex, title = "Classification: HC vs AD using Canevelli FI ('old' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_Canevelli_FI_old_males"))
+}  
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_Canevelli_male_old_res <- validation_ML_with_cv(lda_model = lda_Canevelli_HC_and_AD,
+                                                   input_data = HC_and_AD_Canevelli,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_Canevelli_male_old_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2_Canevelli}
+
+if (save_ML_table){
+  HC_AD_res_male_old_flex <- df2flextable(as.data.frame(HC_AD_Canevelli_male_old_res), digits=5)
+  table2docx(HC_AD_res_male_old_flex, title = "Classification: HC vs AD using Canevelli FI ('old' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_Canevelli_FI_old_males"))
+}
+```
+
+
+```{r, echo=FALSE, results='hide', message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_male_young_flex <- df2flextable(as.data.frame(HC_AD_cv_standard_male_young_res), digits=5)
+  table2docx(HC_AD_cv_res_male_young_flex, title = "Classification: HC vs AD using standard FI ('young' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_standard_FI_young_males"))
+}
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_standard_male_young_res <- validation_ML_with_cv(lda_model = lda_orig_HC_and_AD,
+                                                   input_data = HC_and_AD_standard,
+
+                                                   Dx_groups= "HC and AD")
+
+knitr::kable(HC_AD_standard_male_young_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_male_young_flex <- df2flextable(as.data.frame(HC_AD_standard_male_young_res), digits=5)
+  table2docx(HC_AD_res_male_young_flex, title = "Classification: HC vs AD using standard FI ('young' males)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_standard_FI_young_males"))
+}
+
+```
+
+#### Refined FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_refined_male_young_res  <- get_classification_metrics(HC_AD_lda_male_young, feature="FI_refined_lda")
+knitr::kable(HC_AD_cv_refined_male_young_res)
+
+```
+
+## "young" females
+
+### HC vs AD
+
+
+#### Standard FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_standard_female_young_res <- get_classification_metrics(HC_AD_lda_female_young, feature="FI_standard_lda") 
+knitr::kable(HC_AD_cv_standard_female_young_res)
+
+```
+
+```{r, echo=FALSE, results='hide', message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_cv_standard_female_young_res), digits=5)
+  table2docx(HC_AD_cv_res_female_young_flex, title = "Classification: HC vs AD using standard FI ('young' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_standard_FI_young_females"))
+}
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_standard_female_young_res <- validation_ML_with_cv(lda_model = lda_orig_HC_and_AD_female_young,
+                                                   input_data = HC_and_AD_female_young,
+
+                                                   Dx_groups= "HC and AD")
+
+knitr::kable(HC_AD_standard_female_young_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_standard_female_young_res), digits=5)
+  table2docx(HC_AD_res_female_young_flex, title = "Classification: HC vs AD using standard FI ('young' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_standard_FI_young_females"))
+}
+
+```
+
+#### Refined FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_refined_female_young_res  <- get_classification_metrics(HC_AD_lda_female_young, feature="FI_refined_lda")
+knitr::kable(HC_AD_cv_refined_female_young_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_cv_refined_female_young_res), digits=5)
+  table2docx(HC_AD_cv_res_female_young_flex, title = "Classification: HC vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_refined_FI_young_females"))
+}  
+```
+
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+
+HC_AD_refined_female_young_res <- validation_ML_with_cv(lda_model = lda_refined_HC_and_AD,
+                                                   input_data = HC_and_AD_refined,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_refined_female_young_res)
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_refined_female_young_res), digits=5)
+  table2docx(HC_AD_res_female_young_flex, title = "Classification: HC vs AD using refined FI ('young' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_refined_FI_young_females"))
+}
+
+```
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_Canevelli_female_young_res  <- get_classification_metrics(HC_AD_lda_female_young, feature="FI_Canevelli_lda")
+knitr::kable(HC_AD_cv_Canevelli_female_young_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+if (save_ML_table){
+  HC_AD_cv_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_cv_Canevelli_female_young_res), digits=5)
+  table2docx(HC_AD_cv_res_female_young_flex, title = "Classification: HC vs AD using Canevelli FI ('young' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_Canevelli_FI_young_females"))
+}  
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_Canevelli_female_young_res <- validation_ML_with_cv(lda_model = lda_Canevelli_HC_and_AD,
+                                                   input_data = HC_and_AD_Canevelli,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_Canevelli_female_young_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2_Canevelli}
+
+if (save_ML_table){
+  HC_AD_res_female_young_flex <- df2flextable(as.data.frame(HC_AD_Canevelli_female_young_res), digits=5)
+  table2docx(HC_AD_res_female_young_flex, title = "Classification: HC vs AD using Canevelli FI ('young' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_Canevelli_FI_young_females"))
+}
+```
+
+
+
+## "old" females
+
+### HC vs AD
+
+
+#### Standard FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_standard_female_old_res <- get_classification_metrics(HC_AD_lda_female_old, feature="FI_standard_lda") 
+knitr::kable(HC_AD_cv_standard_female_old_res)
+
+```
+
+```{r, echo=FALSE, results='hide', message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_female_old_flex <- df2flextable(as.data.frame(HC_AD_cv_standard_female_old_res), digits=5)
+  table2docx(HC_AD_cv_res_female_old_flex, title = "Classification: HC vs AD using standard FI ('old' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_standard_FI_old_females"))
+}
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_standard_female_old_res <- validation_ML_with_cv(lda_model = lda_orig_HC_and_AD_female_old,
+                                                   input_data = HC_and_AD_female_old,
+
+                                                   Dx_groups= "HC and AD")
+
+knitr::kable(HC_AD_standard_female_old_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_female_old_flex <- df2flextable(as.data.frame(HC_AD_standard_female_old_res), digits=5)
+  table2docx(HC_AD_res_female_old_flex, title = "Classification: HC vs AD using standard FI ('old' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_standard_FI_old_females"))
+}
+
+```
+
+#### Refined FI
+
+```{r, echo=FALSE, eval=only_for_ADNI1}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_refined_female_old_res  <- get_classification_metrics(HC_AD_lda_female_old, feature="FI_refined_lda")
+knitr::kable(HC_AD_cv_refined_female_old_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1}
+if (save_ML_table){
+  HC_AD_cv_res_female_old_flex <- df2flextable(as.data.frame(HC_AD_cv_refined_female_old_res), digits=5)
+  table2docx(HC_AD_cv_res_female_old_flex, title = "Classification: HC vs AD using refined FI ", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_refined_FI_old_females"))
+}  
+```
+
+
+```{r echo=FALSE, eval=only_for_ADNI2}
+print("Results from classifying ADNI2/ADNIGO")
+
+
+HC_AD_refined_female_old_res <- validation_ML_with_cv(lda_model = lda_refined_HC_and_AD,
+                                                   input_data = HC_and_AD_refined,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_refined_female_old_res)
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2}
+if (save_ML_table){
+  HC_AD_res_female_old_flex <- df2flextable(as.data.frame(HC_AD_refined_female_old_res), digits=5)
+  table2docx(HC_AD_res_female_old_flex, title = "Classification: HC vs AD using refined FI ('old' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_refined_FI_old_females"))
+}
+
+```
+
+
+```{r, echo=FALSE, eval=include_Canevelli}
+knitr::asis_output("#### Canevelli FI\\n")
+```
+
+```{r, echo=FALSE, eval=only_for_ADNI1_Canevelli}
+print("Cross-validated results (ADNI1)")
+HC_AD_cv_Canevelli_female_old_res  <- get_classification_metrics(HC_AD_lda_female_old, feature="FI_Canevelli_lda")
+knitr::kable(HC_AD_cv_Canevelli_female_old_res)
+
+```
+
+```{r, echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI1_Canevelli}
+if (save_ML_table){
+  HC_AD_cv_res_female_old_flex <- df2flextable(as.data.frame(HC_AD_cv_Canevelli_female_old_res), digits=5)
+  table2docx(HC_AD_cv_res_female_old_flex, title = "Classification: HC vs AD using Canevelli FI ('old' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI1_HC_AD_cv_Canevelli_FI_old_females"))
+}  
+```
+
+```{r echo=FALSE, eval=only_for_ADNI2_Canevelli}
+print("Results from classifying ADNI2/ADNIGO")
+
+HC_AD_Canevelli_female_old_res <- validation_ML_with_cv(lda_model = lda_Canevelli_HC_and_AD,
+                                                   input_data = HC_and_AD_Canevelli,
+
+                                                   Dx_groups= "HC and AD")
+knitr::kable(HC_AD_Canevelli_female_old_res)
+
+```
+
+```{r echo=FALSE, results="hide", message=FALSE, eval=only_for_ADNI2_Canevelli}
+
+if (save_ML_table){
+  HC_AD_res_female_old_flex <- df2flextable(as.data.frame(HC_AD_Canevelli_female_old_res), digits=5)
+  table2docx(HC_AD_res_female_old_flex, title = "Classification: HC vs AD using Canevelli FI ('old' females)", target =
+               paste0(results_dir, "/", chosen_FI_refined, "/ADNI2_ADNIGO_HC_AD_Canevelli_FI_old_females"))
+}
 ```
