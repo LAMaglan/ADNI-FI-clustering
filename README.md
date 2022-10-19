@@ -1,5 +1,8 @@
 # ADNI-FI-clustering
 
+Study using code published in [GeroScience](https://doi.org/10.1007/s11357-022-00669-2). See citation below if using code.
+<br>
+<br>
 Code and files to compute, refine and run analyses for frailty indices
 <br>
 based on data from the Alzheimer's Disease Neuroimaging Iniative (ADNI):
@@ -94,3 +97,8 @@ repo is cloned to). Takes an input csv-files from `refine_FI_analyses.Rmd`
 Code to run mortality analyses. Need to add path to working directory  (i.e. where csv-files from
 <br>
 `refine_FI_analyses.Rmd` are) and add name of said csv-file
+
+## Citation
+```
+Engvig, A., Maglanoc, L.A., Doan, N. et al. Data-driven health deficit assessment improves a frailty index’s prediction of current cognitive status and future conversion to dementia: results from ADNI. GeroScience (2022). https://doi.org/10.1007/s11357-022-00669-2
+```
