@@ -100,5 +100,7 @@ Code to run mortality analyses. Need to add path to working directory  (i.e. whe
 
 ## Citation
 ```
-Engvig, A., Maglanoc, L.A., Doan, N. et al. Data-driven health deficit assessment improves a frailty index’s prediction of current cognitive status and future conversion to dementia: results from ADNI. GeroScience (2022). https://doi.org/10.1007/s11357-022-00669-2
+Engvig, A., Maglanoc, L.A., Doan, N. et al. Data-driven health deficit assessment improves a frailty 
+index’s prediction of current cognitive status and future conversion to dementia: results from ADNI. 
+GeroScience (2022). https://doi.org/10.1007/s11357-022-00669-2
 ```
